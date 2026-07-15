@@ -2,9 +2,11 @@
 
 A seamless GNOME experience with automatic window arrangement and proactive workspace management for an uninterrupted workflow.
 
-Continuum is a GNOME Shell extension that combines automatic mosaic window
-arrangement, proactive workspace management, and immediate focus for windows
-that demand attention.
+Continuum keeps your GNOME desktop organized without manual window shuffling.
+It arranges open windows into a space-filling mosaic, opens the Overview when a
+workspace becomes empty, and brings apps to the front when they need your
+attention instead of showing a "Window is ready" notification.
+
 It brings together the window-management behavior of
 [Mosaic WM](https://github.com/CleoMenezesJr/MosaicWM) and the empty-workspace
 behavior of
