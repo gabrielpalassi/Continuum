@@ -1,0 +1,25 @@
+{
+  "name": "continuum",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "all": "npm run remove && npm run build && npm run setup",
+    "build": "bash scripts/build.sh",
+    "setup": "bash scripts/install.sh",
+    "remove": "gnome-extensions uninstall continuum@gabrielpalassi.github.io 2>/dev/null || true",
+    "start": "env MUTTER_DEBUG_DUMMY_MODE_SPECS=1256x768 dbus-run-session -- gnome-shell --nested",
+    "start:multimonitor": "env MUTTER_DEBUG_NUM_DUMMY_MONITORS=2 dbus-run-session -- gnome-shell --nested",
+    "fmt": "prettier --check .",
+    "fmt:fix": "prettier --write .",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "fmt-lint": "npm run fmt && npm run lint",
+    "fmt-lint:fix": "npm run fmt:fix && npm run lint:fix"
+  },
+  "devDependencies": {
+    "eslint": "^9.19.0",
+    "eslint-plugin-jsdoc": "^50.6.9",
+    "prettier": "^3.5.3"
+  }
+}

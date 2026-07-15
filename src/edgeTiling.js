@@ -1,0 +1,1976 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Window-management behavior adapted from Mosaic WM
+// by Cléo Menezes Jr. and contributors:
+// https://github.com/CleoMenezesJr/MosaicWM
+// Edge tiling (snap to screen edges) functionality
+
+import * as Logger from './logger.js';
+import GLib from 'gi://GLib';
+import Meta from 'gi://Meta';
+import * as constants from './constants.js';
+import {TileZone} from './constants.js';
+import * as WindowState from './windowState.js';
+import {IS_MINIATURE, ANIMATING_MINIATURE, MINIATURE_ANIM_KIND} from './windowState.js';
+import {getMiniatureSize} from './miniature.js';
+
+import GObject from 'gi://GObject';
+
+export const EdgeTilingManager = GObject.registerClass(
+    {
+        GTypeName: 'ContinuumEdgeTilingManager',
+        Signals: {
+            'edge-tiling-changed': {param_types: [GObject.TYPE_OBJECT, GObject.TYPE_INT]}, // (window, zone)
+        },
+    },
+    class EdgeTilingManager extends GObject.Object {
+        _init() {
+            super._init();
+            this._isResizing = false;
+            this._animationsManager = null;
+            this._tilingManager = null;
+            this._windowingManager = null;
+            this._miniatureManager = null;
+            this._timeoutRegistry = null;
+        }
+
+        setAnimationsManager(manager) {
+            this._animationsManager = manager;
+        }
+
+        setTimeoutRegistry(registry) {
+            this._timeoutRegistry = registry;
+        }
+
+        clearAllStates() {
+            // Disconnect resize listeners from all known windows
+            const allWindows = global.display.get_tab_list(Meta.TabList.NORMAL, null);
+            for (const window of allWindows) {
+                const signalId = WindowState.get(window, 'edgeResizeSignalId');
+                if (signalId) {
+                    try {
+                        window.disconnect(signalId);
+                    } catch (_e) {
+                        // Ignore if window destroyed
+                    }
+                    WindowState.remove(window, 'edgeResizeSignalId');
+                }
+                // Clear other states
+                WindowState.remove(window, 'edgeTilingState');
+                WindowState.remove(window, 'edgePreviousSize');
+            }
+
+            this._isResizing = false;
+        }
+
+        destroy() {
+            this.clearAllStates();
+            this._animationsManager = null;
+            this._tilingManager = null;
+            this._windowingManager = null;
+            this._miniatureManager = null;
+            this._timeoutRegistry = null;
+        }
+
+        _hasEdgeTiledWindowsOnSide(workspace, side) {
+            if (!workspace) return false;
+
+            // Iterating WeakMap is not possible in GJS, so query workspace windows instead
+            // This is robust but slightly more expensive than a Map lookup
+
+            const windows = workspace.list_windows();
+            for (const win of windows) {
+                const state = WindowState.get(win, 'edgeTilingState');
+                if (!state || state.zone === TileZone.NONE || state.zone === TileZone.FULLSCREEN)
+                    continue;
+
+                if (side === 'left') {
+                    if (
+                        state.zone === TileZone.LEFT_FULL ||
+                        state.zone === TileZone.TOP_LEFT ||
+                        state.zone === TileZone.BOTTOM_LEFT
+                    ) {
+                        return true;
+                    }
+                } else if (side === 'right') {
+                    if (
+                        state.zone === TileZone.RIGHT_FULL ||
+                        state.zone === TileZone.TOP_RIGHT ||
+                        state.zone === TileZone.BOTTOM_RIGHT
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        detectZone(cursorX, cursorY, workArea, workspace) {
+            const threshold = constants.EDGE_TILING_THRESHOLD;
+            const thirdY = workArea.height / 3;
+
+            // Check TOP edge first (maximize)
+            if (cursorY < workArea.y + threshold) {
+                return TileZone.FULLSCREEN;
+            }
+
+            if (cursorX < workArea.x + threshold) {
+                const hasLeftWindows = this._hasEdgeTiledWindowsOnSide(workspace, 'left');
+
+                if (!hasLeftWindows) return TileZone.LEFT_FULL;
+
+                const relY = cursorY - workArea.y;
+                if (relY < thirdY) return TileZone.TOP_LEFT;
+                if (relY > workArea.height - thirdY) return TileZone.BOTTOM_LEFT;
+                return TileZone.LEFT_FULL;
+            }
+
+            if (cursorX > workArea.x + workArea.width - threshold) {
+                const hasRightWindows = this._hasEdgeTiledWindowsOnSide(workspace, 'right');
+
+                if (!hasRightWindows) return TileZone.RIGHT_FULL;
+
+                const relY = cursorY - workArea.y;
+                if (relY < thirdY) return TileZone.TOP_RIGHT;
+                if (relY > workArea.height - thirdY) return TileZone.BOTTOM_RIGHT;
+                return TileZone.RIGHT_FULL;
+            }
+            return TileZone.NONE;
+        }
+
+        _getExistingSideWidth(workspace, monitor, side) {
+            if (!workspace || monitor === undefined) return null;
+
+            const workspaceWindows = workspace
+                .list_windows()
+                .filter(
+                    w =>
+                        w.get_monitor() === monitor &&
+                        !w.is_hidden() &&
+                        w.get_window_type() === Meta.WindowType.NORMAL
+                );
+
+            let existing = null;
+            for (const w of workspaceWindows) {
+                const state = this.getWindowState(w);
+                if (!state || !state.zone) continue;
+
+                if (
+                    side === 'LEFT' &&
+                    (state.zone === TileZone.LEFT_FULL ||
+                        state.zone === TileZone.TOP_LEFT ||
+                        state.zone === TileZone.BOTTOM_LEFT)
+                ) {
+                    existing = w;
+                    break;
+                } else if (
+                    side === 'RIGHT' &&
+                    (state.zone === TileZone.RIGHT_FULL ||
+                        state.zone === TileZone.TOP_RIGHT ||
+                        state.zone === TileZone.BOTTOM_RIGHT)
+                ) {
+                    existing = w;
+                    break;
+                }
+            }
+
+            if (existing) {
+                const frame = existing.get_frame_rect();
+                return frame.width;
+            }
+            return null;
+        }
+
+        _getExistingQuarterHeight(workspace, monitor, zone) {
+            if (!workspace || monitor === undefined) return null;
+
+            const workspaceWindows = workspace
+                .list_windows()
+                .filter(
+                    w =>
+                        w.get_monitor() === monitor &&
+                        !w.is_hidden() &&
+                        w.get_window_type() === Meta.WindowType.NORMAL
+                );
+
+            const existing = workspaceWindows.find(w => {
+                const state = this.getWindowState(w);
+                return state && state.zone === zone;
+            });
+
+            if (existing) {
+                const frame = existing.get_frame_rect();
+                return frame.height;
+            }
+            return null;
+        }
+
+        getZoneRect(zone, workArea, windowToTile = null) {
+            if (!workArea) return null;
+
+            let existingWidth = null;
+
+            if (windowToTile) {
+                const workspace = windowToTile.get_workspace();
+                const monitor = windowToTile.get_monitor();
+                const workspaceWindows = workspace
+                    .list_windows()
+                    .filter(
+                        w =>
+                            w.get_monitor() === monitor &&
+                            w.get_id() !== windowToTile.get_id() &&
+                            !w.is_hidden() &&
+                            w.get_window_type() === Meta.WindowType.NORMAL
+                    );
+
+                let oppositeZone = null;
+                if (zone === TileZone.LEFT_FULL) oppositeZone = TileZone.RIGHT_FULL;
+                else if (zone === TileZone.RIGHT_FULL) oppositeZone = TileZone.LEFT_FULL;
+
+                if (oppositeZone) {
+                    const existingWindow = workspaceWindows.find(w => {
+                        const state = this.getWindowState(w);
+                        return state && state.zone === oppositeZone;
+                    });
+
+                    if (existingWindow) {
+                        // Mid-animation the frame is a transient size; the ease target is the width it will
+                        // settle at, so a freshly auto-tiled partner splits 50/50 instead of chasing the blur.
+                        const animTarget = this._animationsManager?.getAnimatingTarget(
+                            existingWindow.get_id()
+                        );
+                        existingWidth = animTarget?.width ?? existingWindow.get_frame_rect().width;
+                        Logger.log(
+                            `getZoneRect: Found existing tiled window with width ${existingWidth}px`
+                        );
+                    }
+                }
+            }
+
+            const halfHeight = Math.floor(workArea.height / 2);
+            const halfWidth = Math.floor(workArea.width / 2);
+
+            const workspace = windowToTile?.get_workspace();
+            const monitor = windowToTile?.get_monitor();
+
+            switch (zone) {
+                case TileZone.LEFT_FULL:
+                    return {
+                        x: workArea.x,
+                        y: workArea.y,
+                        width: existingWidth ? workArea.width - existingWidth : halfWidth,
+                        height: workArea.height,
+                    };
+
+                case TileZone.RIGHT_FULL:
+                    return {
+                        x: existingWidth ? workArea.x + existingWidth : workArea.x + halfWidth,
+                        y: workArea.y,
+                        width: existingWidth
+                            ? workArea.width - existingWidth
+                            : workArea.width - halfWidth,
+                        height: workArea.height,
+                    };
+
+                case TileZone.TOP_LEFT: {
+                    const leftWidth =
+                        this._getExistingSideWidth(workspace, monitor, 'LEFT') || halfWidth;
+                    const bottomHeight = this._getExistingQuarterHeight(
+                        workspace,
+                        monitor,
+                        TileZone.BOTTOM_LEFT
+                    );
+                    return {
+                        x: workArea.x,
+                        y: workArea.y,
+                        width: leftWidth,
+                        height: bottomHeight ? workArea.height - bottomHeight : halfHeight,
+                    };
+                }
+
+                case TileZone.TOP_RIGHT: {
+                    const rightWidth =
+                        this._getExistingSideWidth(workspace, monitor, 'RIGHT') || halfWidth;
+                    const bottomHeight = this._getExistingQuarterHeight(
+                        workspace,
+                        monitor,
+                        TileZone.BOTTOM_RIGHT
+                    );
+                    return {
+                        x: workArea.x + workArea.width - rightWidth,
+                        y: workArea.y,
+                        width: rightWidth,
+                        height: bottomHeight ? workArea.height - bottomHeight : halfHeight,
+                    };
+                }
+
+                case TileZone.BOTTOM_LEFT: {
+                    const leftWidth =
+                        this._getExistingSideWidth(workspace, monitor, 'LEFT') || halfWidth;
+                    const topHeight = this._getExistingQuarterHeight(
+                        workspace,
+                        monitor,
+                        TileZone.TOP_LEFT
+                    );
+                    return {
+                        x: workArea.x,
+                        y: topHeight ? workArea.y + topHeight : workArea.y + halfHeight,
+                        width: leftWidth,
+                        height: topHeight
+                            ? workArea.height - topHeight
+                            : workArea.height - halfHeight,
+                    };
+                }
+
+                case TileZone.BOTTOM_RIGHT: {
+                    const rightWidth =
+                        this._getExistingSideWidth(workspace, monitor, 'RIGHT') || halfWidth;
+                    const topHeight = this._getExistingQuarterHeight(
+                        workspace,
+                        monitor,
+                        TileZone.TOP_RIGHT
+                    );
+                    return {
+                        x: workArea.x + workArea.width - rightWidth,
+                        y: topHeight ? workArea.y + topHeight : workArea.y + halfHeight,
+                        width: rightWidth,
+                        height: topHeight
+                            ? workArea.height - topHeight
+                            : workArea.height - halfHeight,
+                    };
+                }
+
+                case TileZone.FULLSCREEN:
+                    return {
+                        x: workArea.x,
+                        y: workArea.y,
+                        width: workArea.width,
+                        height: workArea.height,
+                    };
+                default:
+                    return null;
+            }
+        }
+
+        saveWindowState(window) {
+            const winId = window.get_id();
+            const existingState = WindowState.get(window, 'edgeTilingState');
+
+            if (existingState) {
+                Logger.log(
+                    `Window ${winId} already has saved state (${existingState.width}x${existingState.height}), preserving it`
+                );
+                return;
+            }
+
+            const frame = window.get_frame_rect();
+            WindowState.set(window, 'edgeTilingState', {
+                x: frame.x,
+                y: frame.y,
+                width: frame.width,
+                height: frame.height,
+                zone: TileZone.NONE,
+            });
+            Logger.log(`Saved window ${winId} PRE-TILING state: ${frame.width}x${frame.height}`);
+        }
+
+        getWindowState(window) {
+            return WindowState.get(window, 'edgeTilingState');
+        }
+
+        getEdgeTiledWindows(workspace, monitor) {
+            const windows = workspace
+                .list_windows()
+                .filter(
+                    w =>
+                        w.get_monitor() === monitor &&
+                        !w.is_skip_taskbar() &&
+                        w.window_type === Meta.WindowType.NORMAL
+                );
+
+            return windows
+                .map(w => ({window: w, state: this.getWindowState(w)}))
+                .filter(({state}) => state && state.zone !== TileZone.NONE)
+                .map(({window, state}) => ({window, zone: state.zone}));
+        }
+
+        getNonEdgeTiledWindows(workspace, monitor) {
+            const windows = workspace
+                .list_windows()
+                .filter(
+                    w =>
+                        w.get_monitor() === monitor &&
+                        !w.is_skip_taskbar() &&
+                        w.window_type === Meta.WindowType.NORMAL
+                );
+
+            return windows.filter(w => {
+                const state = this.getWindowState(w);
+                return !state || state.zone === TileZone.NONE;
+            });
+        }
+
+        getWindowInZone(zone, workspace, monitor) {
+            const edgeTiledWindows = this.getEdgeTiledWindows(workspace, monitor);
+
+            for (const {window, zone: windowZone} of edgeTiledWindows) {
+                if (windowZone === zone) {
+                    return window;
+                }
+            }
+            return null;
+        }
+
+        calculateRemainingSpace(workspace, monitor) {
+            if (!workspace || monitor === undefined || monitor === null || monitor < 0) {
+                Logger.log(
+                    `calculateRemainingSpace: Invalid inputs (ws=${workspace}, mon=${monitor})`
+                );
+                return null;
+            }
+
+            // Validation for monitor index
+            const nMonitors = global.display.get_n_monitors();
+            if (monitor >= nMonitors) {
+                Logger.log(
+                    `calculateRemainingSpace: Monitor index ${monitor} out of bounds (${nMonitors})`
+                );
+                return null;
+            }
+
+            const workArea = workspace.get_work_area_for_monitor(monitor);
+            const edgeTiledWindows = this.getEdgeTiledWindows(workspace, monitor);
+
+            if (edgeTiledWindows.length === 0) return workArea;
+
+            const hasLeftFull = edgeTiledWindows.some(w => w.zone === TileZone.LEFT_FULL);
+            const hasLeftQuarters = edgeTiledWindows.some(
+                w => w.zone === TileZone.TOP_LEFT || w.zone === TileZone.BOTTOM_LEFT
+            );
+
+            const hasRightFull = edgeTiledWindows.some(w => w.zone === TileZone.RIGHT_FULL);
+            const hasRightQuarters = edgeTiledWindows.some(
+                w => w.zone === TileZone.TOP_RIGHT || w.zone === TileZone.BOTTOM_RIGHT
+            );
+
+            if (hasLeftFull || hasLeftQuarters) {
+                let maxRight = workArea.x;
+                edgeTiledWindows.forEach(w => {
+                    if (
+                        w.zone === TileZone.LEFT_FULL ||
+                        w.zone === TileZone.TOP_LEFT ||
+                        w.zone === TileZone.BOTTOM_LEFT
+                    ) {
+                        const rect = w.window.get_frame_rect();
+                        maxRight = Math.max(maxRight, rect.x + rect.width);
+                    }
+                });
+
+                return {
+                    x: maxRight,
+                    y: workArea.y,
+                    width: workArea.x + workArea.width - maxRight,
+                    height: workArea.height,
+                };
+            }
+
+            if (hasRightFull || hasRightQuarters) {
+                let minLeft = workArea.x + workArea.width;
+                edgeTiledWindows.forEach(w => {
+                    if (
+                        w.zone === TileZone.RIGHT_FULL ||
+                        w.zone === TileZone.TOP_RIGHT ||
+                        w.zone === TileZone.BOTTOM_RIGHT
+                    ) {
+                        const rect = w.window.get_frame_rect();
+                        minLeft = Math.min(minLeft, rect.x);
+                    }
+                });
+
+                return {
+                    x: workArea.x,
+                    y: workArea.y,
+                    width: minLeft - workArea.x,
+                    height: workArea.height,
+                };
+            }
+
+            return workArea;
+        }
+
+        calculateRemainingSpaceForZone(zone, workArea) {
+            const halfWidth = Math.floor(workArea.width / 2);
+
+            switch (zone) {
+                case TileZone.LEFT_FULL:
+                case TileZone.TOP_LEFT:
+                case TileZone.BOTTOM_LEFT:
+                    return {
+                        x: workArea.x + halfWidth,
+                        y: workArea.y,
+                        width: workArea.width - halfWidth,
+                        height: workArea.height,
+                    };
+
+                case TileZone.RIGHT_FULL:
+                case TileZone.TOP_RIGHT:
+                case TileZone.BOTTOM_RIGHT:
+                    return {
+                        x: workArea.x,
+                        y: workArea.y,
+                        width: halfWidth,
+                        height: workArea.height,
+                    };
+
+                default:
+                    return workArea;
+            }
+        }
+
+        clearWindowState(window) {
+            const winId = window.get_id();
+            const state = WindowState.get(window, 'edgeTilingState');
+
+            // If this was a quarter tile, expand the adjacent quarter to FULL
+            if (state && state.zone && this._isQuarterZone(state.zone)) {
+                Logger.log(`Quarter tile ${winId} being removed from zone ${state.zone}`);
+
+                const adjacentZone = this._getAdjacentQuarterZone(state.zone);
+                if (adjacentZone) {
+                    const adjacentWindow = this._findWindowInZone(
+                        adjacentZone,
+                        window.get_workspace()
+                    );
+
+                    if (adjacentWindow) {
+                        Logger.log(
+                            `Found adjacent quarter ${adjacentWindow.get_id()} in zone ${adjacentZone}, expanding to FULL`
+                        );
+
+                        const fullZone = this._getFullZoneFromQuarter(state.zone);
+                        const workspace = window.get_workspace();
+                        const monitor = window.get_monitor();
+                        const workArea = workspace.get_work_area_for_monitor(monitor);
+                        const fullRect = this.getZoneRect(fullZone, workArea, adjacentWindow);
+
+                        if (fullRect) {
+                            adjacentWindow.move_resize_frame(
+                                false,
+                                fullRect.x,
+                                fullRect.y,
+                                fullRect.width,
+                                fullRect.height
+                            );
+
+                            const adjacentState = WindowState.get(
+                                adjacentWindow,
+                                'edgeTilingState'
+                            );
+                            if (adjacentState) adjacentState.zone = fullZone;
+
+                            Logger.log(
+                                `Expanded quarter to ${fullZone}: ${fullRect.width}x${fullRect.height}`
+                            );
+                        }
+                    }
+                }
+            }
+
+            // autoTileMaster/autoTileDependents are cleaned up in removeTile;
+            // this path only needs to drop the tiling state itself.
+            WindowState.remove(window, 'edgeTilingState');
+        }
+
+        registerAutoTileDependency(dependentWindow, masterWindow) {
+            WindowState.set(dependentWindow, 'autoTileMaster', masterWindow);
+
+            let dependents = WindowState.get(masterWindow, 'autoTileDependents');
+            if (!dependents) {
+                dependents = new Set();
+                WindowState.set(masterWindow, 'autoTileDependents', dependents);
+            }
+            dependents.add(dependentWindow);
+
+            Logger.log(
+                `Registered auto-tile dependency: ${dependentWindow.get_id()} depends on ${masterWindow.get_id()}`
+            );
+        }
+
+        isEdgeTiled(window) {
+            if (!window) return false;
+            const state = WindowState.get(window, 'edgeTilingState');
+            return state && state.zone !== TileZone.NONE;
+        }
+
+        // Can this window be resized to fill a zone? A max-size cap below the zone means it can't,
+        // so such a window stays in the mosaic (miniaturized) instead of being paired as a half-tile.
+        isEdgeTileable(window, zoneRect) {
+            if (!this._canResize(window)) return false;
+            if (zoneRect && window.get_max_size) {
+                const [hasMax, maxW, maxH] = window.get_max_size();
+                if (
+                    hasMax &&
+                    maxW > 0 &&
+                    maxH > 0 &&
+                    (maxW < zoneRect.width || maxH < zoneRect.height)
+                )
+                    return false;
+            }
+            return true;
+        }
+
+        // Edge tiling and miniaturization are exclusive. Leave the actor's transform alone though, since
+        // animateWindow eases from it, and the stale anim keys would make it skip the scale ease.
+        _dropMiniature(window) {
+            if (!this._miniatureManager || !WindowState.get(window, IS_MINIATURE)) return;
+            this._miniatureManager.destroyMiniature(window);
+            WindowState.remove(window, ANIMATING_MINIATURE);
+            WindowState.remove(window, MINIATURE_ANIM_KIND);
+        }
+
+        checkQuarterExpansion(workspace, monitor) {
+            const edgeTiledWindows = this.getEdgeTiledWindows(workspace, monitor);
+            if (edgeTiledWindows.length === 0) return;
+
+            const workArea = workspace.get_work_area_for_monitor(monitor);
+
+            // Check left side
+            const leftQuarters = edgeTiledWindows.filter(
+                w => w.zone === TileZone.TOP_LEFT || w.zone === TileZone.BOTTOM_LEFT
+            );
+
+            if (leftQuarters.length === 1) {
+                const window = leftQuarters[0].window;
+                Logger.log('Single quarter on left - expanding to LEFT_FULL');
+
+                const state = WindowState.get(window, 'edgeTilingState');
+                if (state) state.zone = TileZone.LEFT_FULL;
+
+                const rect = this.getZoneRect(TileZone.LEFT_FULL, workArea, window);
+                if (rect) {
+                    if (this._animationsManager) {
+                        this._animationsManager.animateWindow(window, rect, {subtle: true});
+                    } else {
+                        window.move_resize_frame(false, rect.x, rect.y, rect.width, rect.height);
+                    }
+                }
+            }
+
+            // Check right side
+            const rightQuarters = edgeTiledWindows.filter(
+                w => w.zone === TileZone.TOP_RIGHT || w.zone === TileZone.BOTTOM_RIGHT
+            );
+
+            if (rightQuarters.length === 1) {
+                const window = rightQuarters[0].window;
+                Logger.log('Single quarter on right - expanding to RIGHT_FULL');
+
+                const state = WindowState.get(window, 'edgeTilingState');
+                if (state) state.zone = TileZone.RIGHT_FULL;
+
+                const rect = this.getZoneRect(TileZone.RIGHT_FULL, workArea, window);
+                if (rect) {
+                    if (this._animationsManager) {
+                        this._animationsManager.animateWindow(window, rect, {subtle: true});
+                    } else {
+                        window.move_resize_frame(false, rect.x, rect.y, rect.width, rect.height);
+                    }
+                }
+            }
+        }
+
+        _isQuarterZone(zone) {
+            return (
+                zone === TileZone.TOP_LEFT ||
+                zone === TileZone.BOTTOM_LEFT ||
+                zone === TileZone.TOP_RIGHT ||
+                zone === TileZone.BOTTOM_RIGHT
+            );
+        }
+
+        isQuarterZone(zone) {
+            return this._isQuarterZone(zone);
+        }
+
+        _getAdjacentQuarterZone(zone) {
+            switch (zone) {
+                case TileZone.TOP_LEFT:
+                    return TileZone.BOTTOM_LEFT;
+                case TileZone.BOTTOM_LEFT:
+                    return TileZone.TOP_LEFT;
+                case TileZone.TOP_RIGHT:
+                    return TileZone.BOTTOM_RIGHT;
+                case TileZone.BOTTOM_RIGHT:
+                    return TileZone.TOP_RIGHT;
+                default:
+                    return null;
+            }
+        }
+
+        _getFullZoneFromQuarter(zone) {
+            if (zone === TileZone.TOP_LEFT || zone === TileZone.BOTTOM_LEFT) {
+                return TileZone.LEFT_FULL;
+            } else {
+                return TileZone.RIGHT_FULL;
+            }
+        }
+
+        _findWindowInZone(zone, workspace) {
+            const windows = workspace.list_windows();
+            for (const win of windows) {
+                const state = WindowState.get(win, 'edgeTilingState');
+                if (state && state.zone === zone) return win;
+            }
+            return null;
+        }
+
+        setTilingManager(tilingManager) {
+            this._tilingManager = tilingManager;
+        }
+
+        setWindowingManager(windowingManager) {
+            this._windowingManager = windowingManager;
+        }
+
+        setMiniatureManager(miniatureManager) {
+            this._miniatureManager = miniatureManager;
+        }
+
+        _canResize(window, _targetWidth, _targetHeight) {
+            if (window.window_type !== 0) {
+                // Meta.WindowType.NORMAL
+                Logger.log(`Window type ${window.window_type} is not suitable for edge tiling`);
+                return false;
+            }
+
+            if (window.allows_resize && !window.allows_resize()) {
+                Logger.log('Window does not allow resize');
+                return false;
+            }
+            return true;
+        }
+
+        applyTile(window, zone, workArea, skipOverflowCheck = false) {
+            this.saveWindowState(window);
+
+            const winId = window.get_id();
+
+            const oldMaster = WindowState.get(window, 'autoTileMaster');
+            if (oldMaster) {
+                Logger.log(`Manual retile breaks auto-tile dependency for ${winId}`);
+                const deps = WindowState.get(oldMaster, 'autoTileDependents');
+                if (deps) deps.delete(window);
+                WindowState.remove(window, 'autoTileMaster');
+            }
+
+            if (zone === TileZone.FULLSCREEN) {
+                window.maximize();
+                const state = WindowState.get(window, 'edgeTilingState');
+                if (state) state.zone = zone;
+                Logger.log(`Maximized window ${window.get_id()}`);
+                this.emit('edge-tiling-changed', window, zone);
+                return true;
+            }
+
+            const rect = this.getZoneRect(zone, workArea, window);
+            if (!rect) {
+                Logger.log(`Invalid zone ${zone}`);
+                return false;
+            }
+
+            if (!this._canResize(window, rect.width, rect.height)) return false;
+
+            const workspace = window.get_workspace();
+            const monitor = window.get_monitor();
+            let fullToQuarterConversion = null;
+
+            if (zone === TileZone.BOTTOM_LEFT || zone === TileZone.TOP_LEFT) {
+                Logger.log(`Checking for LEFT_FULL conversion, zone=${zone}`);
+                const workspaceWindows = workspace
+                    .list_windows()
+                    .filter(
+                        w =>
+                            w.get_monitor() === monitor &&
+                            w.get_id() !== window.get_id() &&
+                            !w.is_hidden() &&
+                            w.get_window_type() === Meta.WindowType.NORMAL
+                    );
+
+                Logger.log(`Found ${workspaceWindows.length} potential windows`);
+
+                const leftFullWindow = workspaceWindows.find(w => {
+                    const state = this.getWindowState(w);
+                    Logger.log(
+                        `Window ${w.get_id()} state: ${state ? `zone=${state.zone}` : 'no state'}`
+                    );
+                    return state && state.zone === TileZone.LEFT_FULL;
+                });
+
+                if (leftFullWindow) {
+                    Logger.log(`Found LEFT_FULL window ${leftFullWindow.get_id()} for conversion`);
+                    const newZone =
+                        zone === TileZone.BOTTOM_LEFT ? TileZone.TOP_LEFT : TileZone.BOTTOM_LEFT;
+                    fullToQuarterConversion = {window: leftFullWindow, newZone};
+                } else {
+                    Logger.log('No LEFT_FULL window found for conversion');
+                }
+            } else if (zone === TileZone.BOTTOM_RIGHT || zone === TileZone.TOP_RIGHT) {
+                const workspaceWindows = workspace
+                    .list_windows()
+                    .filter(
+                        w =>
+                            w.get_monitor() === monitor &&
+                            w.get_id() !== window.get_id() &&
+                            !w.is_hidden() &&
+                            w.get_window_type() === Meta.WindowType.NORMAL
+                    );
+
+                const rightFullWindow = workspaceWindows.find(w => {
+                    const state = this.getWindowState(w);
+                    return state && state.zone === TileZone.RIGHT_FULL;
+                });
+
+                if (rightFullWindow) {
+                    const newZone =
+                        zone === TileZone.BOTTOM_RIGHT ? TileZone.TOP_RIGHT : TileZone.BOTTOM_RIGHT;
+                    fullToQuarterConversion = {window: rightFullWindow, newZone};
+                }
+            }
+
+            let savedFullTileWidth = null;
+            if (fullToQuarterConversion) {
+                const fullFrame = fullToQuarterConversion.window.get_frame_rect();
+                savedFullTileWidth = fullFrame.width;
+                Logger.log(
+                    `Converting FULL tile ${fullToQuarterConversion.window.get_id()} to quarter zone ${fullToQuarterConversion.newZone}, preserving width=${savedFullTileWidth}px`
+                );
+            }
+
+            window.unmaximize();
+
+            this._timeoutRegistry.addIdle(() => {
+                this._dropMiniature(window);
+                // The zone dictates this window's frame now, so a leftover smart-resize target would
+                // only make the clamp detector learn a false minimum against it.
+                WindowState.remove(window, 'targetSmartResizeSize');
+
+                if (this._animationsManager) {
+                    this._animationsManager.animateWindow(window, rect, {subtle: true});
+                } else {
+                    // Nobody eases the leftover miniature transform away here, so clear it by hand.
+                    const actor = window.get_compositor_private();
+                    if (actor) {
+                        actor.remove_all_transitions();
+                        actor.set_scale(1, 1);
+                        actor.set_translation(0, 0, 0);
+                    }
+                    window.move_resize_frame(false, rect.x, rect.y, rect.width, rect.height);
+                }
+
+                this.setupResizeListener(window);
+
+                const state = WindowState.get(window, 'edgeTilingState');
+                if (state) state.zone = zone;
+
+                Logger.log(`Applied edge tile zone ${zone} to window ${winId}`);
+
+                if (fullToQuarterConversion && savedFullTileWidth) {
+                    const convertedRect = this.getZoneRect(
+                        fullToQuarterConversion.newZone,
+                        workArea,
+                        fullToQuarterConversion.window
+                    );
+
+                    convertedRect.width = savedFullTileWidth;
+                    rect.width = savedFullTileWidth;
+
+                    if (
+                        fullToQuarterConversion.newZone === TileZone.TOP_LEFT ||
+                        fullToQuarterConversion.newZone === TileZone.BOTTOM_LEFT
+                    ) {
+                        convertedRect.x = workArea.x;
+                        rect.x = workArea.x;
+                    } else {
+                        convertedRect.x = workArea.x + workArea.width - savedFullTileWidth;
+                        rect.x = workArea.x + workArea.width - savedFullTileWidth;
+                    }
+
+                    const halfHeight = Math.floor(workArea.height / 2);
+
+                    if (this._animationsManager) {
+                        this._animationsManager.animateWindow(
+                            fullToQuarterConversion.window,
+                            {
+                                x: convertedRect.x,
+                                y: convertedRect.y,
+                                width: convertedRect.width,
+                                height: halfHeight,
+                            },
+                            {subtle: true}
+                        );
+
+                        this._animationsManager.animateWindow(window, {
+                            x: rect.x,
+                            y: rect.y,
+                            width: rect.width,
+                            height: halfHeight,
+                        });
+                    } else {
+                        fullToQuarterConversion.window.move_resize_frame(
+                            false,
+                            convertedRect.x,
+                            convertedRect.y,
+                            convertedRect.width,
+                            halfHeight
+                        );
+                        window.move_resize_frame(false, rect.x, rect.y, rect.width, halfHeight);
+                    }
+
+                    Logger.log(
+                        `Applied quarter tiles with halfHeight=${halfHeight}px, width=${savedFullTileWidth}px`
+                    );
+
+                    const convertedState = WindowState.get(
+                        fullToQuarterConversion.window,
+                        'edgeTilingState'
+                    );
+                    if (convertedState) {
+                        Logger.log(
+                            `Converted window original state: ${convertedState.width}x${convertedState.height} (preserving for restore)`
+                        );
+                        convertedState.zone = fullToQuarterConversion.newZone;
+                    }
+
+                    this.emit('edge-tiling-changed', window, zone);
+                    if (fullToQuarterConversion) {
+                        this.emit(
+                            'edge-tiling-changed',
+                            fullToQuarterConversion.window,
+                            fullToQuarterConversion.newZone
+                        );
+                    }
+
+                    this._timeoutRegistry.add(constants.POLL_INTERVAL_MS, () => {
+                        if (
+                            !window.get_compositor_private() ||
+                            !fullToQuarterConversion.window.get_compositor_private()
+                        ) {
+                            return GLib.SOURCE_REMOVE;
+                        }
+
+                        const actualConvertedFrame =
+                            fullToQuarterConversion.window.get_frame_rect();
+                        const actualNewFrame = window.get_frame_rect();
+
+                        if (
+                            actualConvertedFrame.height !== halfHeight ||
+                            actualNewFrame.height !== halfHeight
+                        ) {
+                            if (zone === TileZone.BOTTOM_LEFT || zone === TileZone.BOTTOM_RIGHT) {
+                                if (actualNewFrame.height > halfHeight) {
+                                    const topHeight = workArea.height - actualNewFrame.height;
+                                    const bottomY = workArea.y + topHeight;
+                                    fullToQuarterConversion.window.move_resize_frame(
+                                        false,
+                                        convertedRect.x,
+                                        workArea.y,
+                                        convertedRect.width,
+                                        topHeight
+                                    );
+                                    window.move_resize_frame(
+                                        false,
+                                        rect.x,
+                                        bottomY,
+                                        rect.width,
+                                        actualNewFrame.height
+                                    );
+                                } else {
+                                    const bottomY =
+                                        actualConvertedFrame.y + actualConvertedFrame.height;
+                                    const bottomHeight = workArea.y + workArea.height - bottomY;
+                                    window.move_resize_frame(
+                                        false,
+                                        rect.x,
+                                        bottomY,
+                                        rect.width,
+                                        bottomHeight
+                                    );
+                                }
+                            } else {
+                                if (actualNewFrame.height > halfHeight) {
+                                    const bottomHeight = workArea.height - actualNewFrame.height;
+                                    const bottomY = workArea.y + actualNewFrame.height;
+                                    fullToQuarterConversion.window.move_resize_frame(
+                                        false,
+                                        convertedRect.x,
+                                        bottomY,
+                                        convertedRect.width,
+                                        bottomHeight
+                                    );
+                                } else {
+                                    const bottomY = actualNewFrame.y + actualNewFrame.height;
+                                    const bottomHeight = workArea.y + workArea.height - bottomY;
+                                    fullToQuarterConversion.window.move_resize_frame(
+                                        false,
+                                        convertedRect.x,
+                                        bottomY,
+                                        convertedRect.width,
+                                        bottomHeight
+                                    );
+                                }
+                            }
+                        }
+
+                        if (this._tilingManager) {
+                            this._tilingManager.tileWorkspaceWindows(
+                                workspace,
+                                null,
+                                monitor,
+                                false
+                            );
+                        }
+                        return GLib.SOURCE_REMOVE;
+                    });
+                }
+
+                // Handle mosaic windows that can't fit in remaining space
+                if (!skipOverflowCheck) {
+                    const remSpace = this.calculateRemainingSpace(
+                        window.get_workspace(),
+                        window.get_monitor()
+                    );
+                    this._handleMosaicOverflow(window, zone, remSpace);
+                }
+                return GLib.SOURCE_REMOVE;
+            });
+
+            return true;
+        }
+
+        removeTile(window, callback = null, placeAtCursor = false) {
+            const winId = window.get_id();
+            const savedState = WindowState.get(window, 'edgeTilingState');
+
+            if (!savedState || savedState.zone === TileZone.NONE) {
+                Logger.log(`removeTile: Window ${winId} is not edge-tiled`);
+                if (callback) callback();
+                return;
+            }
+
+            Logger.log(`removeTile: Removing tile from window ${winId}, zone=${savedState.zone}`);
+            Logger.log(
+                `removeTile: Saved state to restore: ${savedState.width}x${savedState.height} at (${savedState.x}, ${savedState.y})`
+            );
+
+            this._removeResizeListener(window);
+
+            const savedWidth = savedState.width;
+            const savedHeight = savedState.height;
+            const savedZone = savedState.zone;
+
+            // Clear our own zone first so a cascading dependent measures free space without counting this tile.
+            savedState.zone = TileZone.NONE;
+
+            // Back to a normal window: restore the pre-tiling preferred size and drop any mosaic-learned minimum.
+            WindowState.set(window, 'preferredSize', {width: savedWidth, height: savedHeight});
+            WindowState.remove(window, 'actualMinWidth');
+            WindowState.remove(window, 'actualMinHeight');
+            WindowState.remove(window, 'targetSmartResizeSize');
+            WindowState.set(window, 'isConstrainedByMosaic', false);
+
+            Logger.log(`removeTile: Checking dependencies for master=${winId}`);
+            const dependents = WindowState.get(window, 'autoTileDependents');
+            if (dependents && dependents.size > 0) {
+                Logger.log(`removeTile: Found ${dependents.size} dependents`);
+                // Copy set to avoid modification during iteration
+                const depsArray = Array.from(dependents);
+                for (const dependent of depsArray) {
+                    Logger.log(`removeTile: Calling removeTile on dependent ${dependent.get_id()}`);
+                    this.removeTile(dependent);
+
+                    // Cleanup refs
+                    WindowState.remove(dependent, 'autoTileMaster');
+                }
+                dependents.clear();
+                WindowState.remove(window, 'autoTileDependents');
+            }
+
+            // If this window is a dependent, remove itself from master
+            const master = WindowState.get(window, 'autoTileMaster');
+            if (master) {
+                const masterDeps = WindowState.get(master, 'autoTileDependents');
+                if (masterDeps) masterDeps.delete(window);
+                WindowState.remove(window, 'autoTileMaster');
+            }
+
+            if (this._isQuarterZone(savedZone)) {
+                Logger.log(`Quarter tile ${winId} being removed from zone ${savedZone}`);
+
+                const adjacentZone = this._getAdjacentQuarterZone(savedZone);
+                if (adjacentZone) {
+                    const adjacentWindow = this._findWindowInZone(
+                        adjacentZone,
+                        window.get_workspace()
+                    );
+
+                    if (adjacentWindow) {
+                        const fullZone = this._getFullZoneFromQuarter(savedState.zone);
+                        const workspace = window.get_workspace();
+                        const monitor = window.get_monitor();
+                        const workArea = workspace.get_work_area_for_monitor(monitor);
+                        const fullRect = this.getZoneRect(fullZone, workArea, adjacentWindow);
+
+                        if (fullRect) {
+                            adjacentWindow.move_resize_frame(
+                                false,
+                                fullRect.x,
+                                fullRect.y,
+                                fullRect.width,
+                                fullRect.height
+                            );
+                            const adjacentState = WindowState.get(
+                                adjacentWindow,
+                                'edgeTilingState'
+                            );
+                            if (adjacentState) adjacentState.zone = fullZone;
+                        }
+                    }
+                }
+            }
+
+            if (window.is_maximized()) {
+                window.unmaximize();
+            }
+
+            // Restore the pre-tiling size as it was. Whether it still fits is the mosaic's call, and it
+            // shrinks or miniaturizes accordingly; pre-shrinking here would just lose the size for good.
+            let restoredX;
+            let restoredY;
+            if (placeAtCursor) {
+                const [cursorX, cursorY] = global.get_pointer();
+                restoredX = cursorX - savedWidth / 2;
+                restoredY = cursorY - 20;
+            } else {
+                // Only the window the pointer is holding belongs at the cursor. A dependent or a
+                // swapped-out tile isn't, so it grows in place and lets the mosaic ease it to its slot.
+                const frame = window.get_frame_rect();
+                restoredX = frame.x;
+                restoredY = frame.y;
+            }
+
+            Logger.log(
+                `removeTile: Restoring window ${winId} to size ${savedWidth}x${savedHeight} at (${restoredX}, ${restoredY})`
+            );
+            window.move_resize_frame(false, restoredX, restoredY, savedWidth, savedHeight);
+
+            if (callback) {
+                this._timeoutRegistry.add(
+                    constants.RETILE_DELAY_MS,
+                    () => {
+                        callback();
+                        return GLib.SOURCE_REMOVE;
+                    },
+                    'edgeTiling_removeTileCallback'
+                );
+            }
+        }
+
+        _handleMosaicOverflow(tiledWindow, zone, remainingSpace) {
+            Logger.log(`_handleMosaicOverflow: called for zone=${zone}`);
+
+            const workspace = tiledWindow.get_workspace();
+            const monitor = tiledWindow.get_monitor();
+            const workArea = workspace.get_work_area_for_monitor(monitor);
+
+            // Check if BOTH sides are now edge-tiled (including the window just tiled)
+            const edgeTiledWindows = this.getEdgeTiledWindows(workspace, monitor);
+            const zones = edgeTiledWindows.map(w => w.zone);
+
+            const hasLeft =
+                zones.includes(TileZone.LEFT_FULL) ||
+                zones.some(z => z === TileZone.TOP_LEFT || z === TileZone.BOTTOM_LEFT);
+            const hasRight =
+                zones.includes(TileZone.RIGHT_FULL) ||
+                zones.some(z => z === TileZone.TOP_RIGHT || z === TileZone.BOTTOM_RIGHT);
+
+            const mosaicWindows = this.getNonEdgeTiledWindows(workspace, monitor);
+
+            if (mosaicWindows.length === 0) return;
+
+            // If both sides are occupied, move ALL mosaic windows to new workspace
+            if (hasLeft && hasRight) {
+                Logger.log(
+                    `Both sides edge-tiled - moving ${mosaicWindows.length} mosaic windows to new workspace`
+                );
+                const newWorkspace =
+                    this._windowingManager.createOrReuseAdjacentWorkspace(workspace);
+
+                for (const mosaicWindow of mosaicWindows) {
+                    mosaicWindow.change_workspace(newWorkspace);
+                }
+
+                this._timeoutRegistry.add(
+                    constants.REVERSE_RESIZE_PROTECTION_MS,
+                    () => {
+                        if (this._tilingManager) {
+                            this._tilingManager.tileWorkspaceWindows(workspace, null, monitor);
+                        }
+                        return GLib.SOURCE_REMOVE;
+                    },
+                    'edgeTiling_bothSidesRetile'
+                );
+
+                newWorkspace.activate(global.get_current_time());
+                this._windowingManager.showWorkspaceSwitcher(newWorkspace, monitor);
+                return;
+            }
+
+            // Single edge tile: pair the last window into the opposite half instead of miniaturizing it.
+            if (mosaicWindows.length === 1) {
+                const mosaicWindow = mosaicWindows[0];
+
+                if (zone === TileZone.LEFT_FULL || zone === TileZone.RIGHT_FULL) {
+                    const oppositeZone =
+                        zone === TileZone.LEFT_FULL ? TileZone.RIGHT_FULL : TileZone.LEFT_FULL;
+                    const oppositeRect = this.getZoneRect(oppositeZone, workArea, mosaicWindow);
+
+                    // A window that can't fill the half (max-size capped) falls through to the miniature path.
+                    if (oppositeRect && this.isEdgeTileable(mosaicWindow, oppositeRect)) {
+                        Logger.log(
+                            `_handleMosaicOverflow: auto-tiling single window ${mosaicWindow.get_id()} to opposite zone ${oppositeZone}`
+                        );
+
+                        // Reserve the zone and drop any miniature synchronously so the trigger's size-changed
+                        // retile treats this window as tiled before applyTile positions it, with no race.
+                        this.saveWindowState(mosaicWindow);
+                        const oppState = this.getWindowState(mosaicWindow);
+                        if (oppState) oppState.zone = oppositeZone;
+                        this._dropMiniature(mosaicWindow);
+
+                        this.applyTile(mosaicWindow, oppositeZone, workArea);
+                        this.registerAutoTileDependency(mosaicWindow, tiledWindow);
+                        return;
+                    }
+                }
+            }
+
+            if (!this._tilingManager) return;
+
+            // Use miniature display size for miniaturized windows — get_frame_rect returns original full size.
+            const testTileInfo = this._tilingManager._tile(
+                mosaicWindows.map((w, i) => {
+                    if (WindowState.get(w, IS_MINIATURE)) {
+                        const ms = getMiniatureSize(w);
+                        if (ms) return {index: i, width: ms.width, height: ms.height};
+                    }
+                    const f = w.get_frame_rect();
+                    return {index: i, width: f.width, height: f.height};
+                }),
+                remainingSpace
+            );
+
+            Logger.log(
+                `_handleMosaicOverflow: Checking ${mosaicWindows.length} windows in ${remainingSpace.width}x${remainingSpace.height}. Overflow: ${testTileInfo.overflow}`
+            );
+
+            if (testTileInfo.overflow) {
+                Logger.log(
+                    `Mosaic overflow - scheduling miniaturization for ${mosaicWindows.length} windows`
+                );
+                this._timeoutRegistry.add(
+                    constants.REVERSE_RESIZE_PROTECTION_MS,
+                    () => {
+                        if (this._tilingManager) {
+                            this._tilingManager.tileWorkspaceWindows(workspace, null, monitor);
+                        }
+                        return GLib.SOURCE_REMOVE;
+                    },
+                    'edgeTiling_overflowRetile'
+                );
+            }
+        }
+
+        setupResizeListener(window) {
+            if (WindowState.has(window, 'edgeResizeSignalId')) return;
+
+            const signalId = window.connect('size-changed', () => {
+                this._handleWindowResize(window);
+            });
+
+            WindowState.set(window, 'edgeResizeSignalId', signalId);
+            Logger.log(`Setup resize listener for window ${window.get_id()}`);
+        }
+
+        _removeResizeListener(window) {
+            const signalId = WindowState.get(window, 'edgeResizeSignalId');
+
+            if (signalId) {
+                window.disconnect(signalId);
+                WindowState.remove(window, 'edgeResizeSignalId');
+                Logger.log(`Removed resize listener from window ${window.get_id()}`);
+            }
+        }
+
+        _handleWindowResize(window) {
+            const state = this.getWindowState(window);
+            if (!state || state.zone === TileZone.NONE) return;
+
+            if (this._isResizing) return;
+
+            Logger.log(
+                `Resize detected on edge-tiled window ${window.get_id()}, zone=${state.zone}`
+            );
+
+            if (state.zone === TileZone.LEFT_FULL || state.zone === TileZone.RIGHT_FULL) {
+                this._handleHorizontalResize(window, state.zone);
+            } else if (this._isQuarterZone(state.zone)) {
+                this._handleVerticalResize(window, state.zone);
+            }
+        }
+
+        _handleHorizontalResize(window, zone) {
+            const workspace = window.get_workspace();
+            const monitor = window.get_monitor();
+            const workArea = workspace.get_work_area_for_monitor(monitor);
+
+            const adjacentWindow = this._getAdjacentWindow(window, workspace, monitor, zone);
+
+            if (!adjacentWindow) {
+                // No adjacent edge tile - retile mosaic to adapt to new edge tile size
+                this._handleResizeWithMosaic(window, workspace, monitor);
+                return;
+            }
+
+            this._resizeTiledPair(window, adjacentWindow, workArea, zone);
+        }
+
+        _handleVerticalResize(window, zone) {
+            const workspace = window.get_workspace();
+            const monitor = window.get_monitor();
+            const workArea = workspace.get_work_area_for_monitor(monitor);
+
+            const adjacentZone = this._getAdjacentQuarterZone(zone);
+            if (!adjacentZone) return;
+
+            const adjacentWindow = this._findWindowInZone(adjacentZone, workspace);
+            if (!adjacentWindow) return;
+
+            const resizedFrame = window.get_frame_rect();
+
+            const previousState = WindowState.get(window, 'edgePreviousSize');
+
+            if (!previousState) {
+                const adjacentFrame = adjacentWindow.get_frame_rect();
+                WindowState.set(window, 'edgePreviousSize', {
+                    width: resizedFrame.width,
+                    height: resizedFrame.height,
+                    y: resizedFrame.y,
+                });
+                WindowState.set(adjacentWindow, 'edgePreviousSize', {
+                    width: adjacentFrame.width,
+                    height: adjacentFrame.height,
+                    y: adjacentFrame.y,
+                });
+                return;
+            }
+
+            const newAdjacentHeight = workArea.height - resizedFrame.height;
+            const minHeight = constants.MIN_WINDOW_HEIGHT;
+            const maxResizedHeight = workArea.height - minHeight;
+
+            if (resizedFrame.height > maxResizedHeight) return;
+            if (newAdjacentHeight < minHeight) return;
+
+            const isResizedTop = zone === TileZone.TOP_LEFT || zone === TileZone.TOP_RIGHT;
+            this._isResizing = true;
+
+            try {
+                if (isResizedTop) {
+                    window.move_frame(false, resizedFrame.x, workArea.y);
+                    window.move_resize_frame(
+                        false,
+                        resizedFrame.x,
+                        workArea.y,
+                        resizedFrame.width,
+                        resizedFrame.height
+                    );
+
+                    const adjacentY = workArea.y + resizedFrame.height;
+                    adjacentWindow.move_frame(false, resizedFrame.x, adjacentY);
+                    adjacentWindow.move_resize_frame(
+                        false,
+                        resizedFrame.x,
+                        adjacentY,
+                        resizedFrame.width,
+                        newAdjacentHeight
+                    );
+
+                    WindowState.set(window, 'edgePreviousSize', {
+                        width: resizedFrame.width,
+                        height: resizedFrame.height,
+                        y: workArea.y,
+                    });
+                    WindowState.set(adjacentWindow, 'edgePreviousSize', {
+                        width: resizedFrame.width,
+                        height: newAdjacentHeight,
+                        y: adjacentY,
+                    });
+                } else {
+                    adjacentWindow.move_frame(false, resizedFrame.x, workArea.y);
+                    adjacentWindow.move_resize_frame(
+                        false,
+                        resizedFrame.x,
+                        workArea.y,
+                        resizedFrame.width,
+                        newAdjacentHeight
+                    );
+
+                    const resizedY = workArea.y + newAdjacentHeight;
+                    window.move_frame(false, resizedFrame.x, resizedY);
+                    window.move_resize_frame(
+                        false,
+                        resizedFrame.x,
+                        resizedY,
+                        resizedFrame.width,
+                        resizedFrame.height
+                    );
+
+                    WindowState.set(adjacentWindow, 'edgePreviousSize', {
+                        width: resizedFrame.width,
+                        height: newAdjacentHeight,
+                        y: workArea.y,
+                    });
+                    WindowState.set(window, 'edgePreviousSize', {
+                        width: resizedFrame.width,
+                        height: resizedFrame.height,
+                        y: resizedY,
+                    });
+                }
+            } finally {
+                this._timeoutRegistry.add(
+                    constants.ISRESIZING_FLAG_RESET_MS,
+                    () => {
+                        this._isResizing = false;
+                        return GLib.SOURCE_REMOVE;
+                    },
+                    'edgeTiling_isResizingReset'
+                );
+            }
+        }
+
+        _resizeTiledPair(resizedWindow, adjacentWindow, workArea, zone) {
+            const resizedFrame = resizedWindow.get_frame_rect();
+
+            const previousState = WindowState.get(resizedWindow, 'edgePreviousSize');
+
+            if (!previousState) {
+                const adjacentFrame = adjacentWindow.get_frame_rect();
+                WindowState.set(resizedWindow, 'edgePreviousSize', {
+                    width: resizedFrame.width,
+                    height: resizedFrame.height,
+                    x: resizedFrame.x,
+                });
+                WindowState.set(adjacentWindow, 'edgePreviousSize', {
+                    width: adjacentFrame.width,
+                    height: resizedFrame.height,
+                    x: adjacentFrame.x,
+                });
+                return;
+            }
+
+            const minWidth = constants.MIN_WINDOW_WIDTH;
+            const maxResizedWidth = workArea.width - minWidth;
+
+            if (resizedFrame.width > maxResizedWidth) return;
+
+            const newAdjacentWidth = workArea.width - resizedFrame.width;
+
+            this._isResizing = true;
+
+            try {
+                const isResizedLeft = zone === TileZone.LEFT_FULL;
+
+                if (isResizedLeft) {
+                    resizedWindow.move_frame(false, workArea.x, workArea.y);
+                    resizedWindow.move_resize_frame(
+                        false,
+                        workArea.x,
+                        workArea.y,
+                        resizedFrame.width,
+                        workArea.height
+                    );
+
+                    adjacentWindow.move_frame(false, workArea.x + resizedFrame.width, workArea.y);
+                    adjacentWindow.move_resize_frame(
+                        false,
+                        workArea.x + resizedFrame.width,
+                        workArea.y,
+                        newAdjacentWidth,
+                        workArea.height
+                    );
+
+                    WindowState.set(resizedWindow, 'edgePreviousSize', {
+                        width: resizedFrame.width,
+                        height: workArea.height,
+                        x: workArea.x,
+                    });
+                    WindowState.set(adjacentWindow, 'edgePreviousSize', {
+                        width: newAdjacentWidth,
+                        height: workArea.height,
+                        x: workArea.x + resizedFrame.width,
+                    });
+                } else {
+                    adjacentWindow.move_frame(false, workArea.x, workArea.y);
+                    adjacentWindow.move_resize_frame(
+                        false,
+                        workArea.x,
+                        workArea.y,
+                        newAdjacentWidth,
+                        workArea.height
+                    );
+
+                    resizedWindow.move_frame(false, workArea.x + newAdjacentWidth, workArea.y);
+                    resizedWindow.move_resize_frame(
+                        false,
+                        workArea.x + newAdjacentWidth,
+                        workArea.y,
+                        resizedFrame.width,
+                        workArea.height
+                    );
+
+                    WindowState.set(adjacentWindow, 'edgePreviousSize', {
+                        width: newAdjacentWidth,
+                        height: workArea.height,
+                        x: workArea.x,
+                    });
+                    WindowState.set(resizedWindow, 'edgePreviousSize', {
+                        width: resizedFrame.width,
+                        height: workArea.height,
+                        x: workArea.x + newAdjacentWidth,
+                    });
+                }
+            } finally {
+                this._timeoutRegistry.add(
+                    constants.ISRESIZING_FLAG_RESET_MS,
+                    () => {
+                        this._isResizing = false;
+                        return GLib.SOURCE_REMOVE;
+                    },
+                    'edgeTiling_isResizingReset'
+                );
+            }
+        }
+
+        _handleResizeWithMosaic(_window, workspace, monitor) {
+            // Retile mosaic to adapt to the edge tile's new size
+            if (this._tilingManager) {
+                Logger.log('Edge-tiled window resizing - retiling mosaic to adapt');
+                this._tilingManager.tileWorkspaceWindows(workspace, null, monitor, true);
+            }
+        }
+
+        _getAdjacentWindow(window, workspace, monitor, zone) {
+            const edgeTiledWindows = this.getEdgeTiledWindows(workspace, monitor);
+            const windowId = window.get_id();
+            const targetZone =
+                zone === TileZone.LEFT_FULL ? TileZone.RIGHT_FULL : TileZone.LEFT_FULL;
+            const adjacent = edgeTiledWindows.find(
+                w => w.window.get_id() !== windowId && w.zone === targetZone
+            );
+            return adjacent ? adjacent.window : null;
+        }
+
+        fixTiledPairSizes(resizedWindow, zone) {
+            const workspace = resizedWindow.get_workspace();
+            const monitor = resizedWindow.get_monitor();
+            const workArea = workspace.get_work_area_for_monitor(monitor);
+            const adjacentWindow = this._getAdjacentWindow(resizedWindow, workspace, monitor, zone);
+
+            if (!adjacentWindow) return;
+
+            const resizedFrame = resizedWindow.get_frame_rect();
+            const minWidth = constants.MIN_WINDOW_WIDTH;
+            const impliedAdjacentWidth = workArea.width - resizedFrame.width;
+
+            if (impliedAdjacentWidth < minWidth) {
+                const newAdjacentWidth = minWidth;
+                const newResizedWidth = workArea.width - newAdjacentWidth;
+
+                this._isResizing = true;
+                try {
+                    const isResizedLeft = zone === TileZone.LEFT_FULL;
+                    if (isResizedLeft) {
+                        resizedWindow.move_frame(false, workArea.x, workArea.y);
+                        resizedWindow.move_resize_frame(
+                            false,
+                            workArea.x,
+                            workArea.y,
+                            newResizedWidth,
+                            workArea.height
+                        );
+
+                        adjacentWindow.move_frame(false, workArea.x + newResizedWidth, workArea.y);
+                        adjacentWindow.move_resize_frame(
+                            false,
+                            workArea.x + newResizedWidth,
+                            workArea.y,
+                            newAdjacentWidth,
+                            workArea.height
+                        );
+                    } else {
+                        adjacentWindow.move_frame(false, workArea.x, workArea.y);
+                        adjacentWindow.move_resize_frame(
+                            false,
+                            workArea.x,
+                            workArea.y,
+                            newAdjacentWidth,
+                            workArea.height
+                        );
+
+                        resizedWindow.move_frame(false, workArea.x + newAdjacentWidth, workArea.y);
+                        resizedWindow.move_resize_frame(
+                            false,
+                            workArea.x + newAdjacentWidth,
+                            workArea.y,
+                            newResizedWidth,
+                            workArea.height
+                        );
+                    }
+                } finally {
+                    this._timeoutRegistry.add(
+                        100,
+                        () => {
+                            this._isResizing = false;
+                            return GLib.SOURCE_REMOVE;
+                        },
+                        'edgeTiling_isResizingReset'
+                    );
+                }
+                return;
+            }
+
+            const adjacentFrame = adjacentWindow.get_frame_rect();
+            const totalWidth = resizedFrame.width + adjacentFrame.width;
+
+            if (totalWidth < workArea.width) {
+                const gap = workArea.width - totalWidth;
+                const newResizedWidth = resizedFrame.width + gap;
+
+                this._isResizing = true;
+                try {
+                    const isResizedLeft = zone === TileZone.LEFT_FULL;
+                    if (isResizedLeft) {
+                        resizedWindow.move_frame(false, workArea.x, workArea.y);
+                        resizedWindow.move_resize_frame(
+                            false,
+                            workArea.x,
+                            workArea.y,
+                            newResizedWidth,
+                            workArea.height
+                        );
+
+                        adjacentWindow.move_frame(false, workArea.x + newResizedWidth, workArea.y);
+                        adjacentWindow.move_resize_frame(
+                            false,
+                            workArea.x + newResizedWidth,
+                            workArea.y,
+                            adjacentFrame.width,
+                            workArea.height
+                        );
+                    } else {
+                        adjacentWindow.move_frame(false, workArea.x, workArea.y);
+                        adjacentWindow.move_resize_frame(
+                            false,
+                            workArea.x,
+                            workArea.y,
+                            adjacentFrame.width,
+                            workArea.height
+                        );
+
+                        resizedWindow.move_frame(
+                            false,
+                            workArea.x + adjacentFrame.width,
+                            workArea.y
+                        );
+                        resizedWindow.move_resize_frame(
+                            false,
+                            workArea.x + adjacentFrame.width,
+                            workArea.y,
+                            newResizedWidth,
+                            workArea.height
+                        );
+                    }
+                } finally {
+                    this._timeoutRegistry.add(
+                        100,
+                        () => {
+                            this._isResizing = false;
+                            return GLib.SOURCE_REMOVE;
+                        },
+                        'edgeTiling_isResizingReset'
+                    );
+                }
+            }
+        }
+
+        fixMosaicAfterEdgeResize(edgeTiledWindow, zone) {
+            const workspace = edgeTiledWindow.get_workspace();
+            const monitor = edgeTiledWindow.get_monitor();
+            const workArea = workspace.get_work_area_for_monitor(monitor);
+            const edgeFrame = edgeTiledWindow.get_frame_rect();
+
+            // Get mosaic windows that need space
+            const mosaicWindows = this.getNonEdgeTiledWindows(workspace, monitor);
+            if (mosaicWindows.length === 0) {
+                // No mosaic windows - MUST leave room for at least one minimum-width window
+                const minFreeSpace = constants.MIN_WINDOW_WIDTH;
+                const maxWidth = workArea.width - minFreeSpace;
+
+                if (edgeFrame.width > maxWidth) {
+                    this._isResizing = true;
+                    try {
+                        const isLeft = zone === TileZone.LEFT_FULL;
+                        const x = isLeft ? workArea.x : workArea.x + workArea.width - maxWidth;
+                        edgeTiledWindow.move_resize_frame(
+                            false,
+                            x,
+                            workArea.y,
+                            maxWidth,
+                            workArea.height
+                        );
+                    } finally {
+                        this._timeoutRegistry.add(
+                            50,
+                            () => {
+                                this._isResizing = false;
+                                return GLib.SOURCE_REMOVE;
+                            },
+                            'edgeTiling_isResizingReset'
+                        );
+                    }
+                }
+                return;
+            }
+            // The maximum width for an edge tile is the work area minus the space required by the mosaic.
+
+            let mosaicMinX = Infinity;
+            let mosaicMaxX = 0;
+            for (const w of mosaicWindows) {
+                const f = w.get_frame_rect();
+                mosaicMinX = Math.min(mosaicMinX, f.x);
+                mosaicMaxX = Math.max(mosaicMaxX, f.x + f.width);
+            }
+
+            // Edge tile max = workArea - actualMosaicWidth
+            // This means edge tile cannot exceed the space NOT occupied by mosaic
+            const isLeft = zone === TileZone.LEFT_FULL;
+            let maxEdgeWidth;
+
+            if (isLeft) {
+                // Left edge tile: max = mosaicMinX - workArea.x (space before mosaic)
+                maxEdgeWidth = mosaicMinX - workArea.x;
+            } else {
+                // Right edge tile: max = (workArea.x + workArea.width) - mosaicMaxX (space after mosaic)
+                maxEdgeWidth = workArea.x + workArea.width - mosaicMaxX;
+            }
+
+            // Fallback if mosaic width is somehow 0
+            if (maxEdgeWidth <= 0) {
+                maxEdgeWidth = workArea.width - constants.MIN_WINDOW_WIDTH;
+            }
+
+            if (edgeFrame.width > maxEdgeWidth) {
+                Logger.log(
+                    `Edge tile exceeds max (${edgeFrame.width} > ${maxEdgeWidth}) - constraining to mosaic boundary`
+                );
+                this._isResizing = true;
+                try {
+                    if (isLeft) {
+                        edgeTiledWindow.move_resize_frame(
+                            false,
+                            workArea.x,
+                            workArea.y,
+                            maxEdgeWidth,
+                            workArea.height
+                        );
+                    } else {
+                        const newX = workArea.x + workArea.width - maxEdgeWidth;
+                        edgeTiledWindow.move_resize_frame(
+                            false,
+                            newX,
+                            workArea.y,
+                            maxEdgeWidth,
+                            workArea.height
+                        );
+                    }
+                } finally {
+                    this._timeoutRegistry.add(
+                        50,
+                        () => {
+                            this._isResizing = false;
+                            return GLib.SOURCE_REMOVE;
+                        },
+                        'edgeTiling_isResizingReset'
+                    );
+                }
+            }
+
+            // Always retile mosaic to adapt to new available space
+            if (this._tilingManager) {
+                Logger.log('Retiling mosaic after edge tile resize');
+                this._timeoutRegistry.add(
+                    100,
+                    () => {
+                        this._tilingManager.tileWorkspaceWindows(workspace, null, monitor, true);
+                        return GLib.SOURCE_REMOVE;
+                    },
+                    'edgeTiling_retileMosaic'
+                );
+            }
+        }
+
+        fixQuarterPairSizes(resizedWindow, zone) {
+            const workspace = resizedWindow.get_workspace();
+            const monitor = resizedWindow.get_monitor();
+            const workArea = workspace.get_work_area_for_monitor(monitor);
+            const adjacentZone = this._getAdjacentQuarterZone(zone);
+            if (!adjacentZone) return;
+
+            const adjacentWindow = this._findWindowInZone(adjacentZone, workspace);
+            if (!adjacentWindow) return;
+
+            const resizedFrame = resizedWindow.get_frame_rect();
+            const adjacentFrame = adjacentWindow.get_frame_rect();
+            const absoluteMinHeight = constants.ABSOLUTE_MIN_HEIGHT;
+            const minHeight = Math.max(adjacentFrame.height, absoluteMinHeight);
+            const impliedAdjacentHeight = workArea.height - resizedFrame.height;
+
+            if (impliedAdjacentHeight < minHeight) {
+                const newAdjacentHeight = minHeight;
+                const newResizedHeight = workArea.height - newAdjacentHeight;
+
+                this._isResizing = true;
+                try {
+                    const isResizedTop = zone === TileZone.TOP_LEFT || zone === TileZone.TOP_RIGHT;
+                    if (isResizedTop) {
+                        resizedWindow.move_frame(false, resizedFrame.x, workArea.y);
+                        resizedWindow.move_resize_frame(
+                            false,
+                            resizedFrame.x,
+                            workArea.y,
+                            resizedFrame.width,
+                            newResizedHeight
+                        );
+
+                        const adjacentY = workArea.y + newResizedHeight;
+                        adjacentWindow.move_frame(false, resizedFrame.x, adjacentY);
+                        adjacentWindow.move_resize_frame(
+                            false,
+                            resizedFrame.x,
+                            adjacentY,
+                            resizedFrame.width,
+                            newAdjacentHeight
+                        );
+                    } else {
+                        adjacentWindow.move_frame(false, resizedFrame.x, workArea.y);
+                        adjacentWindow.move_resize_frame(
+                            false,
+                            resizedFrame.x,
+                            workArea.y,
+                            resizedFrame.width,
+                            newAdjacentHeight
+                        );
+
+                        const resizedY = workArea.y + newAdjacentHeight;
+                        resizedWindow.move_frame(false, resizedFrame.x, resizedY);
+                        resizedWindow.move_resize_frame(
+                            false,
+                            resizedFrame.x,
+                            resizedY,
+                            resizedFrame.width,
+                            newResizedHeight
+                        );
+                    }
+                } finally {
+                    this._timeoutRegistry.add(
+                        100,
+                        () => {
+                            this._isResizing = false;
+                            return GLib.SOURCE_REMOVE;
+                        },
+                        'edgeTiling_isResizingReset'
+                    );
+                }
+                return;
+            }
+
+            const totalHeight = resizedFrame.height + adjacentFrame.height;
+
+            if (totalHeight < workArea.height) {
+                const gap = workArea.height - totalHeight;
+                const newResizedHeight = resizedFrame.height + gap;
+
+                this._isResizing = true;
+                try {
+                    const isResizedTop = zone === TileZone.TOP_LEFT || zone === TileZone.TOP_RIGHT;
+                    if (isResizedTop) {
+                        resizedWindow.move_frame(false, resizedFrame.x, workArea.y);
+                        resizedWindow.move_resize_frame(
+                            false,
+                            resizedFrame.x,
+                            workArea.y,
+                            resizedFrame.width,
+                            newResizedHeight
+                        );
+
+                        const adjacentY = workArea.y + newResizedHeight;
+                        adjacentWindow.move_frame(false, resizedFrame.x, adjacentY);
+                        adjacentWindow.move_resize_frame(
+                            false,
+                            resizedFrame.x,
+                            adjacentY,
+                            resizedFrame.width,
+                            adjacentFrame.height
+                        );
+                    } else {
+                        adjacentWindow.move_frame(false, resizedFrame.x, workArea.y);
+                        adjacentWindow.move_resize_frame(
+                            false,
+                            resizedFrame.x,
+                            workArea.y,
+                            resizedFrame.width,
+                            adjacentFrame.height
+                        );
+
+                        const resizedY = workArea.y + adjacentFrame.height;
+                        resizedWindow.move_frame(false, resizedFrame.x, resizedY);
+                        resizedWindow.move_resize_frame(
+                            false,
+                            resizedFrame.x,
+                            resizedY,
+                            resizedFrame.width,
+                            newResizedHeight
+                        );
+                    }
+                } finally {
+                    this._timeoutRegistry.add(
+                        100,
+                        () => {
+                            this._isResizing = false;
+                            return GLib.SOURCE_REMOVE;
+                        },
+                        'edgeTiling_isResizingReset'
+                    );
+                }
+            }
+        }
+    }
+);
+
+export function isQuarterZone(zone) {
+    return (
+        zone === TileZone.TOP_LEFT ||
+        zone === TileZone.BOTTOM_LEFT ||
+        zone === TileZone.TOP_RIGHT ||
+        zone === TileZone.BOTTOM_RIGHT
+    );
+}
