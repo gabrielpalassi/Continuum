@@ -298,9 +298,10 @@ export const ResizeHandler = GObject.registerClass(
             }
         };
 
-        // Isolates a maximized/fullscreen window on an unused monitor or, when every
-        // monitor is occupied, its own workspace. A short debounce means a quick toggle
-        // back never starts the move. Some apps'
+        // A user-maximized/fullscreen window keeps the monitor where the action happened;
+        // its siblings move to another monitor or workspace instead. Born-sacred windows
+        // still use automatic pre-map placement below. A short debounce means a quick
+        // toggle back never starts the move. Some apps'
         // fullscreen doesn't reliably trigger window_manager's size-change signal, so
         // this is also called from windowHandler's notify::fullscreen as a backup -
         // the pending flag below makes calling it twice for the same transition safe.
@@ -373,21 +374,18 @@ export const ResizeHandler = GObject.registerClass(
             }
 
             Logger.log(
-                '[SACRED-ENTER] User entering sacred state - debouncing before moving to new workspace'
+                '[SACRED-ENTER] User entering sacred state - debouncing before evacuating siblings'
             );
             WindowState.set(window, 'sacredEnterPending', true);
-            const preMaxSize =
-                WindowState.get(window, 'preferredSize') || WindowState.get(window, 'openingSize');
 
             this._timeoutRegistry.add(
                 constants.SACRED_ENTER_DEBOUNCE_MS,
                 () => {
-                    WindowState.remove(window, 'sacredEnterPending');
-
                     if (
                         !isWindowAlive(window) ||
                         !this.windowingManager.isMaximizedOrFullscreen(window)
                     ) {
+                        WindowState.remove(window, 'sacredEnterPending');
                         Logger.log(
                             `[SACRED-ENTER] Window ${window.get_id()} already left sacred state - skipping isolation`
                         );
@@ -403,54 +401,26 @@ export const ResizeHandler = GObject.registerClass(
                             currentMonitor
                         ).length <= 1
                     ) {
+                        WindowState.remove(window, 'sacredEnterPending');
                         Logger.log(
                             `[SACRED-ENTER] Window ${window.get_id()} workspace no longer occupied - skipping isolation`
                         );
                         return GLib.SOURCE_REMOVE;
                     }
 
-                    const availableMonitor = this.windowingManager.findAvailableMonitorForWindow(
-                        window,
-                        currentWorkspace,
-                        currentMonitor
-                    );
-                    if (availableMonitor !== null) {
-                        Logger.log(
-                            '[SACRED-ENTER] Empty monitor available - keeping sacred window in current workspace'
-                        );
-                        this.windowingManager.moveWindowToMonitor(
-                            window,
-                            currentWorkspace,
-                            currentMonitor,
-                            availableMonitor
-                        );
-                        return GLib.SOURCE_REMOVE;
-                    }
-
                     Logger.log(
-                        '[SACRED-ENTER] Still in sacred state after debounce - moving to new workspace'
+                        `[SACRED-ENTER] Keeping window ${window.get_id()} on monitor ${currentMonitor}; evacuating siblings`
                     );
-                    const originalWorkspaceIndex = currentWorkspace.index();
-
-                    this.windowingManager
-                        .moveOversizedWindow(window)
-                        .then(newWorkspace => {
-                            if (newWorkspace) {
-                                WindowState.set(window, 'maximizedUndoInfo', {
-                                    originalWorkspace: originalWorkspaceIndex,
-                                    currentWorkspace: newWorkspace.index(),
-                                    monitor: currentMonitor,
-                                    preMaxSize: preMaxSize,
-                                });
-                                this.tilingManager.tileWorkspaceWindows(
-                                    currentWorkspace,
-                                    null,
-                                    currentMonitor,
-                                    false
+                    this._ext.windowHandler
+                        .makeRoomForUserMaximize(window, currentWorkspace, currentMonitor)
+                        .then(evacuated => {
+                            if (!evacuated)
+                                Logger.warn(
+                                    `[SACRED-ENTER] Some siblings could not be evacuated from monitor ${currentMonitor}`
                                 );
-                            }
                         })
-                        .catch(e => Logger.error(`Sacred isolation failed: ${e}`));
+                        .catch(e => Logger.error(`Sacred sibling evacuation failed: ${e}`))
+                        .finally(() => WindowState.remove(window, 'sacredEnterPending'));
                     return GLib.SOURCE_REMOVE;
                 },
                 'resizeHandler_sacredEnterDebounce'

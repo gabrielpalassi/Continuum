@@ -36,6 +36,7 @@ export const DragHandler = GObject.registerClass(
             this._restoringFromEdgeTile = false;
             this._skipNextTiling = null;
             this._lastReorderMonitor = null;
+            this._awaitingUnmaximizeDrag = false;
         }
 
         get windowingManager() {
@@ -106,6 +107,15 @@ export const DragHandler = GObject.registerClass(
                 Logger.log('Edge tiling: grab begin');
                 this._draggedWindow = window;
                 this.tilingManager.setGrabbedWindow(window);
+                this._awaitingUnmaximizeDrag =
+                    this.windowingManager.isMaximizedOrFullscreen(window);
+
+                const originWorkspace =
+                    window.get_workspace() ?? global.workspace_manager.get_active_workspace();
+                WindowState.set(window, 'userMoveOrigin', {
+                    workspace: originWorkspace,
+                    monitor: window.get_monitor(),
+                });
 
                 // Only monitor crossings from this drag should retile a source at the drop.
                 WindowState.remove(window, 'leftMonitor');
@@ -255,8 +265,22 @@ export const DragHandler = GObject.registerClass(
 
         _grabOpEndHandler = (_display, window, grabpo) => {
             this._currentGrabOp = null;
+            this._awaitingUnmaximizeDrag = false;
             // Unconditional: a leftover id would freeze that window out of every later layout.
             this.tilingManager.setGrabbedWindow(null);
+
+            const isMove = isMoveGrabOp(grabpo) || grabpo === Meta.GrabOp.KEYBOARD_MOVING;
+            const destinationWorkspace =
+                window.get_workspace() ?? global.workspace_manager.get_active_workspace();
+            const destinationMonitor = window.get_monitor();
+            const hasSacredDestinationConflict = Boolean(
+                destinationWorkspace &&
+                    this.windowingManager.getSacredOccupant(
+                        window,
+                        destinationWorkspace,
+                        destinationMonitor
+                    )
+            );
 
             if (
                 (isMoveGrabOp(grabpo) || grabpo === Meta.GrabOp.KEYBOARD_MOVING) &&
@@ -387,16 +411,20 @@ export const DragHandler = GObject.registerClass(
                 // Resize-end retiling is handled by resizeHandler.onResizeEnd below, which
                 // keeps resizingWindowId set through the final retile to avoid animation
                 // jiggle. Skip stopDrag's own retile here to avoid two overlapping tiling passes.
-                this.reorderingManager.stopDrag(window, false, skipTiling || isResizeEnd);
+                this.reorderingManager.stopDrag(
+                    window,
+                    false,
+                    skipTiling || isResizeEnd || hasSacredDestinationConflict
+                );
 
                 if (isResizeEnd) {
                     this._ext.resizeHandler.onResizeEnd(window, grabpo, skipTiling);
                 }
 
                 if (
-                    (isMoveGrabOp(grabpo) || grabpo === Meta.GrabOp.KEYBOARD_MOVING) &&
-                    !this.windowingManager.isMaximizedOrFullscreen(window) &&
-                    !skipTiling
+                    isMove &&
+                    (hasSacredDestinationConflict ||
+                        (!this.windowingManager.isMaximizedOrFullscreen(window) && !skipTiling))
                 ) {
                     afterAnimations(
                         this.animationsManager,
@@ -407,29 +435,48 @@ export const DragHandler = GObject.registerClass(
                                 window.get_workspace() ??
                                 global.workspace_manager.get_active_workspace();
                             const monitor = window.get_monitor();
-                            this.tilingManager.tileWorkspaceWindows(
-                                workspace,
-                                window,
-                                monitor,
-                                false
-                            );
+                            const origin = WindowState.get(window, 'userMoveOrigin');
 
-                            // The drag crossed monitors; the siblings it left behind still hold its
-                            // slot open. onWindowLeftMonitor leaves the source here instead of
-                            // retiling mid-grab, which would fight the drag passes above.
-                            const sourceMonitor = WindowState.get(window, 'leftMonitor');
-                            if (sourceMonitor !== undefined && sourceMonitor !== monitor) {
-                                WindowState.remove(window, 'leftMonitor');
-                                this.tilingManager.tileWorkspaceWindows(
-                                    workspace,
-                                    null,
-                                    sourceMonitor,
-                                    false
-                                );
-                            }
+                            this.windowingManager
+                                .makeRoomForUserPlacement(window, workspace, monitor, origin)
+                                .then(handledConflict => {
+                                    WindowState.remove(window, 'userMoveOrigin');
+
+                                    if (
+                                        !handledConflict &&
+                                        !this.windowingManager.isMaximizedOrFullscreen(window) &&
+                                        !skipTiling
+                                    ) {
+                                        this.tilingManager.tileWorkspaceWindows(
+                                            workspace,
+                                            window,
+                                            monitor,
+                                            false
+                                        );
+                                    }
+
+                                    // The drag crossed monitors; the siblings it left behind still hold its
+                                    // slot open. onWindowLeftMonitor leaves the source here instead of
+                                    // retiling mid-grab, which would fight the drag passes above.
+                                    const sourceMonitor = WindowState.get(window, 'leftMonitor');
+                                    if (sourceMonitor !== undefined && sourceMonitor !== monitor) {
+                                        WindowState.remove(window, 'leftMonitor');
+                                        this._ext.windowHandler.retileSourceAfterUserMove(
+                                            window,
+                                            origin?.workspace ?? workspace,
+                                            sourceMonitor
+                                        );
+                                    }
+                                })
+                                .catch(e => {
+                                    WindowState.remove(window, 'userMoveOrigin');
+                                    Logger.error(`User placement conflict resolution failed: ${e}`);
+                                });
                         },
                         this._timeoutRegistry
                     );
+                } else if (isMove) {
+                    WindowState.remove(window, 'userMoveOrigin');
                 }
             } else {
                 this.reorderingManager.stopDrag(window, true);
@@ -439,8 +486,51 @@ export const DragHandler = GObject.registerClass(
             this.drawingManager.hideTilePreview();
         };
 
+        _startUnmaximizedHeaderbarDrag() {
+            if (
+                !this._awaitingUnmaximizeDrag ||
+                !this._draggedWindow ||
+                this.reorderingManager.dragStart ||
+                this.windowingManager.isMaximizedOrFullscreen(this._draggedWindow)
+            )
+                return;
+
+            const workspace =
+                this._draggedWindow.get_workspace() ??
+                global.workspace_manager.get_active_workspace();
+            const monitor = this._draggedWindow.get_monitor();
+            if (!workspace || monitor === null || monitor === undefined) return;
+
+            // The maximize property flips before Mutter restores the old frame. Waiting
+            // for that frame avoids caching a set of drag layouts built around a
+            // monitor-sized descriptor that will disappear on the next configure.
+            const frame = this._draggedWindow.get_frame_rect();
+            const workArea = workspace.get_work_area_for_monitor(monitor);
+            const preferredSize =
+                WindowState.get(this._draggedWindow, 'preferredSize') ||
+                WindowState.get(this._draggedWindow, 'openingSize');
+            const hasSmallerPreferredFrame =
+                preferredSize &&
+                (preferredSize.width < workArea.width - constants.ANIMATION_DIFF_THRESHOLD ||
+                    preferredSize.height < workArea.height - constants.ANIMATION_DIFF_THRESHOLD);
+            const frameIsStillMonitorSized =
+                frame.width >= workArea.width - constants.ANIMATION_DIFF_THRESHOLD &&
+                frame.height >= workArea.height - constants.ANIMATION_DIFF_THRESHOLD;
+            if (hasSmallerPreferredFrame && frameIsStillMonitorSized) return;
+
+            Logger.log(
+                `Headerbar drag: window ${this._draggedWindow.get_id()} restored; starting mosaic previews`
+            );
+            this._awaitingUnmaximizeDrag = false;
+            this.reorderingManager.startDrag(this._draggedWindow);
+            this._lastReorderMonitor = global.display.get_current_monitor();
+        }
+
         _onDragPositionChanged() {
             if (!this._draggedWindow) return;
+
+            this._startUnmaximizedHeaderbarDrag();
+            if (this._awaitingUnmaximizeDrag) return;
 
             const [x, y] = global.get_pointer();
             const monitor = global.display.get_current_monitor();
@@ -606,6 +696,7 @@ export const DragHandler = GObject.registerClass(
             this._restoringFromEdgeTile = false;
             this._isPositionProcessing = false;
             this._currentGrabOp = null;
+            this._awaitingUnmaximizeDrag = false;
         }
     }
 );

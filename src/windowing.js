@@ -13,7 +13,7 @@ import {afterWorkspaceSwitch} from './timing.js';
 import {MONITOR_PLACEMENT_TIMEOUT_MS, RETILE_DELAY_MS, TileZone} from './constants.js';
 import * as WindowState from './windowState.js';
 import {IS_MINIATURE} from './windowState.js';
-import {isWindowAlive} from './liveness.js';
+import {isWindowAlive, isWorkspaceAlive} from './liveness.js';
 
 const BLACKLISTED_WM_CLASSES = ['org.gnome.Screenshot', 'Gnome-screenshot'];
 
@@ -501,6 +501,110 @@ export const WindowingManager = GObject.registerClass(
             );
         }
 
+        getSacredOccupant(window, workspace, monitor) {
+            if (!window || !workspace || monitor === null || monitor === undefined) return null;
+
+            this.invalidateWindowsCache();
+            return (
+                this.getMonitorWorkspaceWindows(workspace, monitor).find(
+                    candidate =>
+                        candidate.get_id() !== window.get_id() &&
+                        !this.isExcluded(candidate) &&
+                        this.isMaximizedOrFullscreen(candidate)
+                ) ?? null
+            );
+        }
+
+        // An explicit move owns its destination. Sacred isolation is still the right
+        // default for newly opened windows, but applying it to a user move either leaves
+        // a normal arrival floating over the maximized window or sends a maximized
+        // arrival straight back where it came from. Move the incumbent instead, keeping
+        // both windows' maximized state intact.
+        async makeRoomForUserPlacement(window, workspace, monitor, origin = null) {
+            const incumbent = this.getSacredOccupant(window, workspace, monitor);
+            if (!incumbent) return false;
+
+            Logger.log(
+                `[USER-PLACEMENT] Window ${window.get_id()} owns WS-${workspace.index()} monitor ${monitor}; relocating sacred incumbent ${incumbent.get_id()}`
+            );
+
+            const originWorkspace = origin?.workspace;
+            const originMonitor = origin?.monitor;
+            const validOrigin =
+                isWorkspaceAlive(originWorkspace) &&
+                originMonitor !== null &&
+                originMonitor !== undefined &&
+                originMonitor >= 0 &&
+                originMonitor < global.display.get_n_monitors() &&
+                (originWorkspace !== workspace || originMonitor !== monitor);
+
+            let originIsEmpty = false;
+            if (validOrigin) {
+                this.invalidateWindowsCache();
+                originIsEmpty =
+                    this.getMonitorWorkspaceWindows(originWorkspace, originMonitor).filter(
+                        candidate =>
+                            candidate.get_id() !== window.get_id() &&
+                            candidate.get_id() !== incumbent.get_id() &&
+                            !this.isExcluded(candidate)
+                    ).length === 0;
+            }
+
+            if (originIsEmpty) {
+                const incumbentWorkspace = incumbent.get_workspace();
+                const incumbentMonitor = incumbent.get_monitor();
+                WindowState.set(incumbent, 'userPlacementDisplaced', true);
+
+                try {
+                    if (incumbentWorkspace !== originWorkspace)
+                        incumbent.change_workspace(originWorkspace);
+
+                    if (incumbentMonitor !== originMonitor) {
+                        const moveStarted = this.moveWindowToMonitor(
+                            incumbent,
+                            originWorkspace,
+                            incumbentMonitor,
+                            originMonitor
+                        );
+                        if (!moveStarted) WindowState.remove(incumbent, 'userPlacementDisplaced');
+                    } else {
+                        this._timeoutRegistry?.addIdle(() => {
+                            WindowState.remove(incumbent, 'userPlacementDisplaced');
+                            this.invalidateWindowsCache();
+                            return GLib.SOURCE_REMOVE;
+                        }, 'windowing_clearUserPlacementDisplacement');
+                    }
+
+                    this.invalidateWindowsCache();
+                    if (!this.isMaximizedOrFullscreen(window))
+                        this._tilingManager?.tileWorkspaceWindows(
+                            workspace,
+                            window,
+                            monitor,
+                            false
+                        );
+                    Logger.log(
+                        `[USER-PLACEMENT] Sacred incumbent ${incumbent.get_id()} moved into the vacated origin`
+                    );
+                    return true;
+                } catch (e) {
+                    WindowState.remove(incumbent, 'userPlacementDisplaced');
+                    Logger.warn(
+                        `[USER-PLACEMENT] Could not move incumbent into the vacated origin: ${e.message}`
+                    );
+                }
+            }
+
+            // The origin still has siblings, so putting a maximized window there would
+            // merely recreate the same conflict. Isolate the incumbent and leave the
+            // user's requested destination untouched.
+            await this.moveOversizedWindow(incumbent, {switchFocus: false});
+            this.invalidateWindowsCache();
+            if (!this.isMaximizedOrFullscreen(window))
+                this._tilingManager?.tileWorkspaceWindows(workspace, window, monitor, false);
+            return true;
+        }
+
         // Placement is workspace-wide: a full source monitor should not force a new
         // workspace while another monitor in the same workspace can accept the window.
         // Prefer emptier monitors so a vacant display wins over squeezing an existing
@@ -558,7 +662,7 @@ export const WindowingManager = GObject.registerClass(
             return null;
         }
 
-        moveWindowToMonitor(window, workspace, sourceMonitor, targetMonitor) {
+        moveWindowToMonitor(window, workspace, sourceMonitor, targetMonitor, onSettled = null) {
             if (
                 targetMonitor === null ||
                 targetMonitor === undefined ||
@@ -572,11 +676,13 @@ export const WindowingManager = GObject.registerClass(
                     Logger.log(
                         `[PLACEMENT] Window ${window.get_id()} is already moving to monitor ${targetMonitor}; skipping duplicate request`
                     );
+                    onSettled?.(false);
                     return true;
                 }
                 Logger.log(
                     `[PLACEMENT] Window ${window.get_id()} already has pending monitor target ${pendingTarget}; ignoring conflicting target ${targetMonitor}`
                 );
+                onSettled?.(false);
                 return false;
             }
 
@@ -623,6 +729,7 @@ export const WindowingManager = GObject.registerClass(
                 Logger.warn(
                     `[PLACEMENT] Failed moving window ${window.get_id()} to monitor ${targetMonitor}: ${e.message}`
                 );
+                onSettled?.(false);
                 return false;
             }
             this.invalidateWindowsCache();
@@ -641,6 +748,8 @@ export const WindowingManager = GObject.registerClass(
                     WindowState.remove(window, 'monitorPlacementSource');
                     WindowState.remove(window, 'monitorPlacementTarget');
                     WindowState.remove(window, 'monitorPlacementEntrancePending');
+                    WindowState.remove(window, 'userPlacementDisplaced');
+                    onSettled?.(false);
                     return GLib.SOURCE_REMOVE;
                 }
 
@@ -649,6 +758,8 @@ export const WindowingManager = GObject.registerClass(
                     WindowState.remove(window, 'monitorPlacementSource');
                     WindowState.remove(window, 'monitorPlacementTarget');
                     WindowState.remove(window, 'monitorPlacementEntrancePending');
+                    WindowState.remove(window, 'userPlacementDisplaced');
+                    onSettled?.(false);
                     return GLib.SOURCE_REMOVE;
                 }
 
@@ -659,6 +770,7 @@ export const WindowingManager = GObject.registerClass(
                     WindowState.get(window, 'monitorPlacementEntrancePending') === true;
                 if (currentMonitor === targetMonitor && !needsStableEntrance) {
                     this.finishMonitorPlacement(window, workspace, targetMonitor);
+                    onSettled?.(true);
                     return GLib.SOURCE_REMOVE;
                 } else if (currentMonitor === targetMonitor && actor?.mapped) {
                     const frame = window.get_frame_rect();
@@ -670,6 +782,7 @@ export const WindowingManager = GObject.registerClass(
                         frame.height === lastStableFrame.height;
                     if (stable) {
                         this.finishMonitorPlacement(window, workspace, targetMonitor);
+                        onSettled?.(true);
                         return GLib.SOURCE_REMOVE;
                     }
                     lastStableFrame = {
@@ -690,6 +803,7 @@ export const WindowingManager = GObject.registerClass(
                 );
                 WindowState.remove(window, 'monitorPlacementSource');
                 WindowState.remove(window, 'monitorPlacementTarget');
+                WindowState.remove(window, 'userPlacementDisplaced');
                 this.invalidateWindowsCache();
                 if (this._tilingManager)
                     this._tilingManager.tileWorkspaceWindows(workspace, null, sourceMonitor, false);
@@ -697,6 +811,7 @@ export const WindowingManager = GObject.registerClass(
                     WindowState.remove(window, 'monitorPlacementEntrancePending');
                     this._animationsManager?.animateMonitorPlacementEntrance(window);
                 }
+                onSettled?.(false);
                 return GLib.SOURCE_REMOVE;
             };
 
@@ -722,6 +837,7 @@ export const WindowingManager = GObject.registerClass(
             const sourceMonitor = WindowState.get(window, 'monitorPlacementSource');
             WindowState.remove(window, 'monitorPlacementSource');
             WindowState.remove(window, 'monitorPlacementTarget');
+            WindowState.remove(window, 'userPlacementDisplaced');
             this.invalidateWindowsCache();
 
             if (this._tilingManager) {

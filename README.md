@@ -41,7 +41,8 @@ Compared with [Mosaic WM](https://github.com/CleoMenezesJr/MosaicWM), Continuum:
 
 - Places windows across all monitors in a workspace instead of filling only the main monitor.
 - Reorganizes remaining windows across monitors after a close instead of re-tiling only the affected monitor.
-- Prefers an empty monitor for maximized or fullscreen windows instead of moving them to another workspace.
+- Places windows that open already maximized or fullscreen on an empty monitor when one is available, instead of immediately isolating them on another workspace.
+- When you maximize or fullscreen an existing window, keeps it on its current monitor and moves the other windows elsewhere to give it the whole monitor.
 - Preserves window order, grouping, and previous positions where possible instead of recomputing every placement from scratch.
 - Restores miniatures to their previous logical positions rather than treating them as newly placed windows.
 - Keeps miniature icons aligned throughout the Overview animation (animation fix).

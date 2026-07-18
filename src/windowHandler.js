@@ -518,6 +518,11 @@ export const WindowHandler = GObject.registerClass(
                 window.get_workspace() ?? global.workspace_manager.get_active_workspace();
             if (!workspace) return;
 
+            // Internal placement has its own source/target transaction. Everything else
+            // is an explicit compositor/user move, so remember the vacancy it creates;
+            // an occupied sacred destination can give its incumbent that vacancy.
+            WindowState.set(window, 'userMoveOrigin', {workspace, monitor});
+
             Logger.log(`Window ${window.get_id()} left monitor ${monitor}`);
 
             // onWindowRemoved runs before this signal and can only see the destination
@@ -534,19 +539,136 @@ export const WindowHandler = GObject.registerClass(
             // Mutter discards resizes while the overview is open, so an overview drag would
             // leave the source mosaic half-positioned. Hand it to onOverviewHidden instead.
             if (Main.overview.visible) {
-                this._pendingRestoreRetiles.push({workspace, monitor, windows: []});
+                this._pendingRestoreRetiles.push({
+                    workspace,
+                    monitor,
+                    windows: [],
+                    movedWindow: window,
+                });
                 return;
             }
 
             this._timeoutRegistry.add(
                 constants.RETILE_DELAY_MS,
                 () => {
-                    this.windowingManager.invalidateWindowsCache();
-                    this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
+                    this.retileSourceAfterUserMove(window, workspace, monitor);
                     return GLib.SOURCE_REMOVE;
                 },
                 'windowHandler_leftMonitorRetile'
             );
+        }
+
+        // A monitor move frees the same capacity as a close/workspace departure. Give a
+        // miniature on the source monitor first claim on it before committing a normal
+        // retile. restoreMiniature emits its own synchronous restoration signal, which
+        // owns the resulting layout when restoration succeeds.
+        retileSourceAfterUserMove(movedWindow, workspace, monitor) {
+            if (!isWorkspaceAlive(workspace)) return false;
+
+            this.windowingManager.invalidateWindowsCache();
+            const remainingWindows = this.windowingManager
+                .getMonitorWorkspaceWindows(workspace, monitor)
+                .filter(
+                    candidate =>
+                        candidate.get_id() !== movedWindow.get_id() &&
+                        !this.edgeTilingManager.isEdgeTiled(candidate) &&
+                        !this.windowingManager.isExcluded(candidate)
+                );
+
+            if (this._tryAutoRestoreMiniature(remainingWindows, workspace, monitor)) return true;
+
+            this.animationsManager.setMembershipChangeBounce(true);
+            this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
+            this.animationsManager.setMembershipChangeBounce(false);
+            return false;
+        }
+
+        _moveWindowToMonitorAndWait(window, workspace, sourceMonitor, targetMonitor) {
+            return new Promise(resolve => {
+                const started = this.windowingManager.moveWindowToMonitor(
+                    window,
+                    workspace,
+                    sourceMonitor,
+                    targetMonitor,
+                    resolve
+                );
+                if (!started) resolve(false);
+            });
+        }
+
+        // A user-maximized window owns the monitor where the action happened. Evacuate
+        // its siblings instead of applying automatic sacred placement to the window the
+        // user just maximized. Miniatures go first so newly available monitor capacity
+        // can restore them before ordinary overflow placement consumes it.
+        async makeRoomForUserMaximize(window, workspace, monitor) {
+            this.windowingManager.invalidateWindowsCache();
+            const siblings = this.windowingManager
+                .getMonitorWorkspaceWindows(workspace, monitor)
+                .filter(
+                    candidate =>
+                        candidate.get_id() !== window.get_id() &&
+                        !this.windowingManager.isExcluded(candidate)
+                )
+                .sort((a, b) => {
+                    const aMiniature = WindowState.get(a, IS_MINIATURE) ? 0 : 1;
+                    const bMiniature = WindowState.get(b, IS_MINIATURE) ? 0 : 1;
+                    return aMiniature - bMiniature || a.get_id() - b.get_id();
+                });
+
+            for (const sibling of siblings) {
+                if (!isWindowAlive(sibling)) continue;
+
+                this.windowingManager.invalidateWindowsCache();
+                const targetMonitor = this.windowingManager.findAvailableMonitorForWindow(
+                    sibling,
+                    workspace,
+                    monitor
+                );
+
+                let targetWorkspace = workspace;
+                let settledMonitor = targetMonitor;
+                if (targetMonitor !== null) {
+                    const moved = await this._moveWindowToMonitorAndWait(
+                        sibling,
+                        workspace,
+                        monitor,
+                        targetMonitor
+                    );
+                    if (!moved) {
+                        targetWorkspace = await this.windowingManager.moveOversizedWindow(sibling, {
+                            switchFocus: false,
+                        });
+                        settledMonitor = sibling.get_monitor();
+                    }
+                } else {
+                    targetWorkspace = await this.windowingManager.moveOversizedWindow(sibling, {
+                        switchFocus: false,
+                    });
+                    settledMonitor = sibling.get_monitor();
+                }
+
+                if (
+                    targetWorkspace &&
+                    settledMonitor !== null &&
+                    WindowState.get(sibling, IS_MINIATURE)
+                ) {
+                    this.windowingManager.invalidateWindowsCache();
+                    const targetWindows = this.windowingManager
+                        .getMonitorWorkspaceWindows(targetWorkspace, settledMonitor)
+                        .filter(candidate => !this.windowingManager.isExcluded(candidate));
+                    this._tryAutoRestoreMiniature(targetWindows, targetWorkspace, settledMonitor);
+                }
+            }
+
+            this.windowingManager.invalidateWindowsCache();
+            const remainingSiblings = this.windowingManager
+                .getMonitorWorkspaceWindows(workspace, monitor)
+                .filter(
+                    candidate =>
+                        candidate.get_id() !== window.get_id() &&
+                        !this.windowingManager.isExcluded(candidate)
+                );
+            return remainingSiblings.length === 0;
         }
 
         onWindowEnteredMonitor(monitor, window) {
@@ -1065,7 +1187,12 @@ export const WindowHandler = GObject.registerClass(
             }
 
             if (this._pendingRestoreRetiles.length > 0) {
-                for (const {workspace: ws, monitor: mon, windows} of this._pendingRestoreRetiles) {
+                for (const {workspace: ws, monitor: mon, windows, movedWindow} of this
+                    ._pendingRestoreRetiles) {
+                    if (movedWindow) {
+                        this.retileSourceAfterUserMove(movedWindow, ws, mon);
+                        continue;
+                    }
                     Logger.log('Retiling after restore delay (deferred: overview was open)');
                     this.animationsManager.setMembershipChangeBounce(true);
                     this._ext.tilingManager.tileWorkspaceWindows(ws, null, mon, true);
@@ -1100,6 +1227,7 @@ export const WindowHandler = GObject.registerClass(
             const lastEvaluatedAt = WindowState.get(window, 'lastEvaluatedAt');
             if (
                 lastEvaluatedAt &&
+                !WindowState.get(window, 'userMoveOrigin') &&
                 monotonicNow() - lastEvaluatedAt < constants.DUPLICATE_EVALUATION_WINDOW_MS
             ) {
                 Logger.log(
@@ -1281,6 +1409,26 @@ export const WindowHandler = GObject.registerClass(
                 .getMonitorWorkspaceWindows(workspace, monitor)
                 .filter(w => !WindowState.get(w, 'pendingInQueue'));
             const otherWindows = workspaceWindows.filter(w => w.get_id() !== window.get_id());
+
+            const userMoveOrigin = WindowState.get(window, 'userMoveOrigin');
+            if (userMoveOrigin && hasExistingSacred) {
+                try {
+                    if (
+                        await this.windowingManager.makeRoomForUserPlacement(
+                            window,
+                            workspace,
+                            monitor,
+                            userMoveOrigin
+                        )
+                    ) {
+                        return workspace;
+                    }
+                } finally {
+                    WindowState.remove(window, 'userMoveOrigin');
+                }
+            } else if (userMoveOrigin) {
+                WindowState.remove(window, 'userMoveOrigin');
+            }
 
             if (hasExistingSacred || (isIncomingSacred && otherWindows.length > 0)) {
                 const availableMonitor = this.windowingManager.findAvailableMonitorForWindow(
@@ -1834,6 +1982,10 @@ export const WindowHandler = GObject.registerClass(
 
         onWindowAdded(_workspace, window) {
             this.windowingManager.invalidateWindowsCache();
+            if (WindowState.get(window, 'userPlacementDisplaced')) {
+                // makeRoomForUserPlacement owns both sides of this internal move.
+                return;
+            }
             if (!this._ext.windowingManager.isRelated(window)) {
                 return;
             }
@@ -1926,6 +2078,14 @@ export const WindowHandler = GObject.registerClass(
                 ) {
                     // Skip if this is an overflow move, not a real drag-drop
                     if (!WindowState.get(WINDOW, 'movedByOverflow')) {
+                        const originWorkspace =
+                            global.workspace_manager.get_workspace_by_index(previousWorkspaceIndex);
+                        if (originWorkspace) {
+                            WindowState.set(WINDOW, 'userMoveOrigin', {
+                                workspace: originWorkspace,
+                                monitor: WindowState.get(WINDOW, 'leftMonitor') ?? MONITOR,
+                            });
+                        }
                         WORKSPACE.activate(global.get_current_time());
                         this._ext.windowingManager.showWorkspaceSwitcher(WORKSPACE, MONITOR);
 
@@ -1980,7 +2140,10 @@ export const WindowHandler = GObject.registerClass(
 
         onWindowRemoved(workspace, window) {
             this.windowingManager.invalidateWindowsCache();
-            if (WindowState.get(window, 'monitorRebalanceInProgress')) {
+            if (
+                WindowState.get(window, 'monitorRebalanceInProgress') ||
+                WindowState.get(window, 'userPlacementDisplaced')
+            ) {
                 return;
             }
             if (!this._ext.windowingManager.isRelated(window)) {
