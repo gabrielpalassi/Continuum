@@ -13,5 +13,5 @@ fi
 gnome-extensions install --force "$archive"
 
 printf '%s\n' \
-    'Continuum was installed locally.' \
+    'Continuum was installed.' \
     'Reload GNOME Shell, then enable continuum@gabrielpalassi.github.io.'

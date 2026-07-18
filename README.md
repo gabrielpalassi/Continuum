@@ -14,10 +14,10 @@ It combines window-management behavior adapted from [Mosaic WM](https://github.c
 Requirements:
 
 - GNOME Shell 50
-- `gnome-extensions` for packaging and local installation
-- Node.js and npm for the development checks
+- `gnome-extensions` for packaging and installation
+- Node.js and npm for development
 
-Continuum is not published to the GNOME Extensions website. Clone the repository, then build and install it locally:
+Continuum is not published to the GNOME Extensions website. Clone the repository, then build and install it:
 
 ```bash
 git clone https://github.com/gabrielpalassi/Continuum.git
@@ -105,7 +105,7 @@ Useful commands while testing:
 | ---------------------------- | ---------------------------------------------- |
 | `npm start`                  | Start a nested Shell with one virtual monitor  |
 | `npm run start:multimonitor` | Start a nested Shell with two virtual monitors |
-| `npm run remove`             | Uninstall the local Continuum extension        |
+| `npm run remove`             | Uninstall the Continuum extension              |
 
 Nested sessions are useful for quick interaction checks, but final testing should also be done in a real Wayland session because Continuum integrates with window placement, workspace switching, drag operations, and Shell animations.
 
