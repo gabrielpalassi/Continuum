@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+extension_zip="$repo_dir/dist/continuum@gabrielpalassi.github.io.shell-extension.zip"
+results_dir="$repo_dir/test-results/integration"
+monitor_wrapper="$repo_dir/test/integration/add-second-monitor.sh"
+
+mkdir -p "$results_dir"
+find "$results_dir" -maxdepth 1 -type f -name '*.log' -delete
+npm run build
+
+passed=0
+failed=0
+
+for scenario in "$repo_dir"/test/integration/scenarios/*.js; do
+    name=$(basename "$scenario" .js)
+    log_file="$results_dir/$name.log"
+    command=(
+        gnome-shell-test-tool
+        --headless
+        --disable-animations
+        --extension
+        "$extension_zip"
+    )
+
+    if [[ "$name" == *.multimonitor ]]; then
+        command+=(--wrap "$monitor_wrapper")
+    fi
+    command+=("$scenario")
+
+    echo "RUN  $name"
+    if GTK_A11Y=none timeout 60s dbus-run-session -- "${command[@]}" >"$log_file" 2>&1; then
+        echo "PASS $name"
+        passed=$((passed + 1))
+    else
+        echo "FAIL $name"
+        failed=$((failed + 1))
+        sed -n '/Script failed:/,+14p' "$log_file"
+        if ! grep -q 'Script failed:' "$log_file"; then
+            tail -30 "$log_file"
+        fi
+    fi
+
+    critical_count=$(grep -Ec '(GNOME Shell|libmutter|Gjs|Clutter)-CRITICAL' "$log_file" || true)
+    critical_count=${critical_count:-0}
+    if [[ "$critical_count" != "0" ]]; then
+        echo "WARN $name emitted $critical_count critical log message(s); see $log_file"
+    fi
+done
+
+echo
+echo "Integration result: $passed passed, $failed failed"
+echo "Logs: $results_dir"
+
+if [[ "$failed" != "0" ]]; then
+    exit 1
+fi

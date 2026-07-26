@@ -97,6 +97,35 @@ export function animateMiniatureToTarget(
     });
 }
 
+// The real frame stays full-sized while a miniature is arranged through actor
+// transforms. Keep actor, target state, and click-overlay movement in one place
+// so animated, drag, and synchronous layout paths cannot drift apart.
+export function placeMiniatureAt(window, targetX, targetY, {animate = false, duration = 0} = {}) {
+    if (!WindowState.get(window, IS_MINIATURE)) return false;
+
+    const actor = window.get_compositor_private();
+    if (!actor || actor.is_destroyed()) return true;
+
+    const scale = WindowState.get(window, MINIATURE_SCALE) ?? 1;
+    const extLeft = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
+    const extTop = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
+
+    if (animate) {
+        animateMiniatureToTarget(actor, window, scale, extLeft, extTop, targetX, targetY, duration);
+        WindowState.get(window, MINIATURE_OVERLAY)?.animateToPosition(duration);
+    } else {
+        if (WindowState.get(window, ANIMATING_MINIATURE))
+            WindowState.set(window, MINIATURE_TARGET_POS, {x: targetX, y: targetY});
+        else {
+            applyMiniatureActorState(actor, scale, extLeft, extTop, targetX, targetY);
+            WindowState.set(window, MINIATURE_TARGET_POS, {x: targetX, y: targetY});
+        }
+        WindowState.get(window, MINIATURE_OVERLAY)?.updatePosition();
+    }
+
+    return true;
+}
+
 // Mutter may reset actor transforms (workspace switch, sync_window_geometry) without
 // signals; this effect enforces miniature transforms every frame at paint time.
 const MiniatureEnforceEffect = GObject.registerClass(

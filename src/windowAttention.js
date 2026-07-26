@@ -4,10 +4,13 @@
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Logger from './logger.js';
+import GLib from 'gi://GLib';
+import {isWindowAlive} from './liveness.js';
 
 export class WindowAttentionManager {
-    constructor(shellAttentionHandler) {
+    constructor(shellAttentionHandler, timeoutRegistry) {
         this._shellAttentionHandler = shellAttentionHandler;
+        this._timeoutRegistry = timeoutRegistry;
         this._shellHandlerSuspended = false;
     }
 
@@ -29,7 +32,25 @@ export class WindowAttentionManager {
     onWindowDemandsAttention(window) {
         if (!window || window.has_focus() || window.is_skip_taskbar()) return;
 
-        Main.activateWindow(window);
+        const previousFocusId = global.display.focus_window?.get_id() ?? null;
+        const activate = () => Main.activateWindow(window, global.get_current_time());
+        activate();
+
+        // Mutter can reject activation in the same dispatch turn that changes the
+        // attention flag or maps a window. Retry briefly while focus remains on the
+        // original window; if the user focuses anything else, their choice wins.
+        let attempts = 0;
+        this._timeoutRegistry?.add(
+            50,
+            () => {
+                if (!isWindowAlive(window) || window.has_focus()) return GLib.SOURCE_REMOVE;
+                const focusedId = global.display.focus_window?.get_id() ?? null;
+                if (focusedId !== previousFocusId || ++attempts > 3) return GLib.SOURCE_REMOVE;
+                activate();
+                return GLib.SOURCE_CONTINUE;
+            },
+            'windowAttention_activationRetry'
+        );
     }
 
     destroy() {
@@ -46,5 +67,6 @@ export class WindowAttentionManager {
 
         this._shellHandlerSuspended = false;
         this._shellAttentionHandler = null;
+        this._timeoutRegistry = null;
     }
 }

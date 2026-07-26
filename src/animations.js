@@ -156,6 +156,10 @@ export const AnimationsManager = GObject.registerClass(
                 }
 
                 WindowState.set(window, 'isMosaicResizing', true);
+                // Apply the position synchronously before the combined request.
+                // Mutter may otherwise retain the actor's old allocation when only
+                // move_resize_frame is used with an unchanged size.
+                window.move_frame(userOp, targetRect.x, targetRect.y);
                 window.move_resize_frame(
                     userOp,
                     targetRect.x,
@@ -164,9 +168,18 @@ export const AnimationsManager = GObject.registerClass(
                     targetRect.height
                 );
                 this._clearMosaicResizingSoon(window);
+                const actor = window.get_compositor_private();
+                if (actor && !actor.is_destroyed()) {
+                    // A native map effect or an interrupted earlier ease can leave
+                    // transforms behind even after animations are disabled. The frame
+                    // move above is authoritative, so normalize the actor as well.
+                    actor.remove_all_transitions();
+                    actor.set_pivot_point(0, 0);
+                    actor.set_scale(1, 1);
+                    actor.set_translation(0, 0, 0);
+                }
                 if (firstPlacement) {
                     WindowState.remove(window, 'pendingFirstPlacement');
-                    const actor = window.get_compositor_private();
                     if (actor) actor.opacity = 255;
                 }
                 if (onComplete) onComplete();
@@ -469,6 +482,15 @@ export const AnimationsManager = GObject.registerClass(
                 // owns clearing the opacity=0 onWindowAdded left it at and the slide-in offset.
                 if (!needsMove && !isFirstPlacement) {
                     window.move_resize_frame(false, rect.x, rect.y, rect.width, rect.height);
+                    if (!getAnimationsEnabled()) {
+                        const actor = window.get_compositor_private();
+                        if (actor && !actor.is_destroyed()) {
+                            actor.remove_all_transitions();
+                            actor.set_pivot_point(0, 0);
+                            actor.set_scale(1, 1);
+                            actor.set_translation(0, 0, 0);
+                        }
+                    }
                     continue;
                 }
 

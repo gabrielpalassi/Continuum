@@ -14,6 +14,7 @@ import {TileZone} from './constants.js';
 import {isResizeGrabOp} from './grabOps.js';
 import {isWorkspaceAlive, isWindowAlive} from './liveness.js';
 import {MosaicModel} from './mosaicModel.js';
+import {restoreBeforeRearrange} from './layoutPlanning.js';
 import GObject from 'gi://GObject';
 
 export const ResizeHandler = GObject.registerClass(
@@ -310,6 +311,7 @@ export const ResizeHandler = GObject.registerClass(
             // Detect born-maximized: size-change fires BEFORE window-created for new windows.
             // A window with no preferredSize/openingSize hasn't been through onWindowCreated yet.
             if (
+                !WindowState.get(window, 'creationObserved') &&
                 !WindowState.get(window, 'preferredSize') &&
                 !WindowState.get(window, 'openingSize') &&
                 this.windowingManager.isMaximizedOrFullscreen(window)
@@ -799,25 +801,30 @@ export const ResizeHandler = GObject.registerClass(
                                 );
                             }
 
-                            const excludeWindow = this._resizeInOverflow ? window : null;
-                            const excludeFromTiling = this._resizeInOverflow;
-                            this.tilingManager.tileWorkspaceWindows(
-                                workspace,
-                                excludeWindow,
-                                monitor,
-                                true,
-                                excludeFromTiling
+                            // Shrinking the dragged window can free room for a sibling
+                            // miniature. Restoration emits synchronously and owns the
+                            // resulting layout, so do not tile once before restoring and
+                            // then immediately tile a second time from the signal handler.
+                            restoreBeforeRearrange(
+                                () =>
+                                    !this._resizeInOverflow &&
+                                    !!this._ext.windowHandler?.tryAutoRestoreMiniature(
+                                        mosaicWindows,
+                                        workspace,
+                                        monitor
+                                    ),
+                                () => {
+                                    const excludeWindow = this._resizeInOverflow ? window : null;
+                                    const excludeFromTiling = this._resizeInOverflow;
+                                    this.tilingManager.tileWorkspaceWindows(
+                                        workspace,
+                                        excludeWindow,
+                                        monitor,
+                                        true,
+                                        excludeFromTiling
+                                    );
+                                }
                             );
-
-                            // Shrinking the dragged window can free up room for a sibling
-                            // miniature mid-drag. The overflow path only checks the inverse.
-                            if (!this._resizeInOverflow && this._ext.windowHandler) {
-                                this._ext.windowHandler._tryAutoRestoreMiniature(
-                                    mosaicWindows,
-                                    workspace,
-                                    monitor
-                                );
-                            }
                         }
 
                         this._sizeChanged = false;

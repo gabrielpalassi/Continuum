@@ -420,4 +420,13 @@ export default [
             ],
         },
     },
+    {
+        files: ['test/**/*.js'],
+        rules: {
+            'comma-dangle': ['error', 'only-multiline'],
+            curly: 'off',
+            'jsdoc/require-jsdoc': 'off',
+            'no-await-in-loop': 'off',
+        },
+    },
 ];

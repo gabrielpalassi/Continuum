@@ -220,7 +220,10 @@ export default class ContinuumExtension extends Extension {
             mutterSettings: this._mutterSettings,
             timeoutRegistry: this._timeoutRegistry,
         });
-        this.windowAttentionManager = new WindowAttentionManager(Main.windowAttentionHandler);
+        this.windowAttentionManager = new WindowAttentionManager(
+            Main.windowAttentionHandler,
+            this._timeoutRegistry
+        );
         this.windowAttentionManager.enable();
 
         this.miniatureManager = new MiniatureManager();

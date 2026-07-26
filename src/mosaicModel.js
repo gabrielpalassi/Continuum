@@ -12,14 +12,29 @@ function idOf(window) {
     return window?.get_id?.();
 }
 
+function validSlot(slot) {
+    return (
+        Number.isFinite(slot?.x) &&
+        Number.isFinite(slot?.y) &&
+        Number.isFinite(slot?.width) &&
+        Number.isFinite(slot?.height) &&
+        slot.width > 0 &&
+        slot.height > 0
+    );
+}
+
+function copySlot(slot) {
+    return {x: slot.x, y: slot.y, width: slot.width, height: slot.height};
+}
+
 export const MosaicModel = {
     setSlot(window, slot, workspace, monitor) {
         const id = idOf(window);
-        if (id === undefined) return;
+        if (id === undefined || !validSlot(slot)) return;
 
         entries.set(id, {
             window,
-            slot: {x: slot.x, y: slot.y, width: slot.width, height: slot.height},
+            slot: copySlot(slot),
             workspaceIndex: workspace?.index?.() ?? null,
             monitor: monitor ?? null,
         });
@@ -27,7 +42,8 @@ export const MosaicModel = {
 
     slotFor(window) {
         const id = idOf(window);
-        return id === undefined ? null : (entries.get(id)?.slot ?? null);
+        const slot = id === undefined ? null : (entries.get(id)?.slot ?? null);
+        return slot ? copySlot(slot) : null;
     },
 
     // Layout intent wins over a transient frame during animation and while the
@@ -46,7 +62,7 @@ export const MosaicModel = {
 
         for (const entry of entries.values()) {
             if (entry.workspaceIndex === workspaceIndex && entry.monitor === monitor)
-                result.push({window: entry.window, slot: entry.slot});
+                result.push({window: entry.window, slot: copySlot(entry.slot)});
         }
 
         return result;
@@ -57,9 +73,9 @@ export const MosaicModel = {
     learn(window, frame) {
         const id = idOf(window);
         const entry = id === undefined ? undefined : entries.get(id);
-        if (!entry) return;
+        if (!entry || !validSlot(frame)) return;
 
-        entry.slot = {x: frame.x, y: frame.y, width: frame.width, height: frame.height};
+        entry.slot = copySlot(frame);
     },
 
     forget(window) {

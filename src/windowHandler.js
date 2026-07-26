@@ -15,6 +15,7 @@ import * as WindowState from './windowState.js';
 import {IS_MINIATURE} from './windowState.js';
 import {ComputedLayouts} from './mosaicModel.js';
 import {isWindowAlive, isWorkspaceAlive} from './liveness.js';
+import {orderWindowsByMru, restoreBeforeRearrange} from './layoutPlanning.js';
 import {afterWorkspaceSwitch, afterAnimations, afterWindowClose, monotonicNow} from './timing.js';
 
 export const WindowHandler = GObject.registerClass(
@@ -561,12 +562,14 @@ export const WindowHandler = GObject.registerClass(
                         !this.windowingManager.isExcluded(candidate)
                 );
 
-            if (this._tryAutoRestoreMiniature(remainingWindows, workspace, monitor)) return true;
-
-            this.animationsManager.setMembershipChangeBounce(true);
-            this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
-            this.animationsManager.setMembershipChangeBounce(false);
-            return false;
+            return restoreBeforeRearrange(
+                () => this.tryAutoRestoreMiniature(remainingWindows, workspace, monitor),
+                () => {
+                    this.animationsManager.setMembershipChangeBounce(true);
+                    this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
+                    this.animationsManager.setMembershipChangeBounce(false);
+                }
+            );
         }
 
         _moveWindowToMonitorAndWait(window, workspace, sourceMonitor, targetMonitor) {
@@ -588,18 +591,21 @@ export const WindowHandler = GObject.registerClass(
         // can restore them before ordinary overflow placement consumes it.
         async makeRoomForUserMaximize(window, workspace, monitor) {
             this.windowingManager.invalidateWindowsCache();
-            const siblings = this.windowingManager
-                .getMonitorWorkspaceWindows(workspace, monitor)
-                .filter(
-                    candidate =>
-                        candidate.get_id() !== window.get_id() &&
-                        !this.windowingManager.isExcluded(candidate)
-                )
-                .sort((a, b) => {
-                    const aMiniature = WindowState.get(a, IS_MINIATURE) ? 0 : 1;
-                    const bMiniature = WindowState.get(b, IS_MINIATURE) ? 0 : 1;
-                    return aMiniature - bMiniature || a.get_id() - b.get_id();
-                });
+            const mru = this.windowingManager.getMRUOrder(workspace);
+            const siblings = orderWindowsByMru(
+                this.windowingManager
+                    .getMonitorWorkspaceWindows(workspace, monitor)
+                    .filter(
+                        candidate =>
+                            candidate.get_id() !== window.get_id() &&
+                            !this.windowingManager.isExcluded(candidate)
+                    ),
+                mru
+            ).sort((a, b) => {
+                const aMiniature = WindowState.get(a, IS_MINIATURE) ? 0 : 1;
+                const bMiniature = WindowState.get(b, IS_MINIATURE) ? 0 : 1;
+                return aMiniature - bMiniature;
+            });
 
             for (const sibling of siblings) {
                 if (!isWindowAlive(sibling)) continue;
@@ -642,7 +648,7 @@ export const WindowHandler = GObject.registerClass(
                     const targetWindows = this.windowingManager
                         .getMonitorWorkspaceWindows(targetWorkspace, settledMonitor)
                         .filter(candidate => !this.windowingManager.isExcluded(candidate));
-                    this._tryAutoRestoreMiniature(targetWindows, targetWorkspace, settledMonitor);
+                    this.tryAutoRestoreMiniature(targetWindows, targetWorkspace, settledMonitor);
                 }
             }
 
@@ -694,15 +700,14 @@ export const WindowHandler = GObject.registerClass(
 
         // Brings back the most recently used miniature when space frees up. Shared by
         // the close, move and live-resize paths so they don't duplicate the fit check.
-        _tryAutoRestoreMiniature(remainingWindows, workspace, monitor) {
+        tryAutoRestoreMiniature(remainingWindows, workspace, monitor) {
             if (!this._ext.miniatureManager) return false;
 
             const mru = this.windowingManager.getMRUOrder(workspace);
-            const rank = window => mru.get(window.get_id()) ?? Number.MAX_SAFE_INTEGER;
-
-            const miniatureWindows = remainingWindows
-                .filter(w => WindowState.get(w, IS_MINIATURE))
-                .sort((a, b) => rank(a) - rank(b));
+            const miniatureWindows = orderWindowsByMru(
+                remainingWindows.filter(w => WindowState.get(w, IS_MINIATURE)),
+                mru
+            );
 
             if (miniatureWindows.length === 0) return false;
 
@@ -716,7 +721,7 @@ export const WindowHandler = GObject.registerClass(
                     )
                 ) {
                     Logger.log(
-                        `_tryAutoRestoreMiniature: keeping mini ${candidate.get_id()} - would overflow if restored`
+                        `tryAutoRestoreMiniature: keeping mini ${candidate.get_id()} - would overflow if restored`
                     );
                     continue;
                 }
@@ -754,10 +759,12 @@ export const WindowHandler = GObject.registerClass(
                 .getMonitorWorkspaceWindows(workspace, preferredMonitor)
                 .filter(w => isWindowAlive(w) && !this.windowingManager.isExcluded(w));
 
-            const miniatureWindows = workspace
-                .list_windows()
-                .filter(w => isWindowAlive(w) && WindowState.get(w, IS_MINIATURE))
-                .sort((a, b) => a.get_id() - b.get_id());
+            const miniatureWindows = orderWindowsByMru(
+                workspace
+                    .list_windows()
+                    .filter(w => isWindowAlive(w) && WindowState.get(w, IS_MINIATURE)),
+                this.windowingManager.getMRUOrder(workspace)
+            );
 
             for (const candidate of miniatureWindows) {
                 const sourceMonitor = candidate.get_monitor();
@@ -1004,7 +1011,7 @@ export const WindowHandler = GObject.registerClass(
 
             if (
                 !wasMovedByOverflow &&
-                this._tryAutoRestoreMiniature(remainingWindows, workspace, monitor)
+                this.tryAutoRestoreMiniature(remainingWindows, workspace, monitor)
             ) {
                 return {
                     settleDelay: constants.MINIATURE_ANIM_MS + constants.RESIZE_SETTLE_DELAY_MS,
@@ -1465,8 +1472,14 @@ export const WindowHandler = GObject.registerClass(
             );
 
             if (canFit) {
-                Logger.log('Window fits - tiling workspace directly');
-                this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
+                // Placement is workspace-wide even when the source monitor still has
+                // room. Keep normal arrivals balanced across displays instead of filling
+                // one monitor until it overflows before considering the others.
+                const moved = this.windowingManager.rebalanceWorkspaceMonitors(workspace, monitor);
+                if (moved === 0) {
+                    Logger.log('Window fits - tiling workspace directly');
+                    this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
+                }
                 return workspace;
             }
 
@@ -1573,6 +1586,9 @@ export const WindowHandler = GObject.registerClass(
 
         onWindowCreated(window) {
             this.windowingManager.invalidateWindowsCache();
+            // Distinguishes a later user maximize from the pre-creation size-change
+            // signal emitted by clients that map already maximized/fullscreen.
+            WindowState.set(window, 'creationObserved', true);
 
             // Shift held at launch: make always-on-top before any tiling runs
             const [, , creationMods] = global.get_pointer();

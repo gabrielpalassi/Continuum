@@ -69,12 +69,15 @@ export const WindowingManager = GObject.registerClass(
             return global.workspace_manager.get_active_workspace();
         }
 
-        // Always pass a workspace: the null path drops Mutter's real MRU list and
-        // falls back to sorting by the coarser user_time.
+        // get_tab_list() asks Mutter whether every candidate is focusable and asserts
+        // when a close signal races a still-unmanaging window. Build the same
+        // most-recent-first policy from live workspace members instead.
         getMRUOrder(workspace) {
             const order = new Map();
-            global.display
-                .get_tab_list(Meta.TabList.NORMAL, workspace)
+            workspace
+                .list_windows()
+                .filter(isWindowAlive)
+                .sort((a, b) => b.get_user_time() - a.get_user_time() || a.get_id() - b.get_id())
                 .forEach((window, index) => order.set(window.get_id(), index));
             return order;
         }
@@ -868,8 +871,8 @@ export const WindowingManager = GObject.registerClass(
             return true;
         }
 
-        // After a close, distribute normal mosaic windows across every monitor in the
-        // workspace. A move is allowed only when it reduces a count imbalance of at
+        // Distribute normal mosaic windows across every monitor in the workspace after
+        // arrivals and departures. A move is allowed only when it reduces a count imbalance of at
         // least two windows and canFitWindow confirms the destination has room. Sacred,
         // edge-tiled and miniature windows keep their explicit monitor placement.
         rebalanceWorkspaceMonitors(workspace, preferredMonitor = null, {deferTiling = false} = {}) {
@@ -972,7 +975,7 @@ export const WindowingManager = GObject.registerClass(
                 if (!selected) break;
 
                 Logger.log(
-                    `[REBALANCE] Moving window ${selected.window.get_id()} from monitor ${selected.source.monitor} to ${selected.target.monitor} after close`
+                    `[REBALANCE] Moving window ${selected.window.get_id()} from monitor ${selected.source.monitor} to ${selected.target.monitor} for workspace balance`
                 );
                 try {
                     // Batch the physical moves first. Tiling source+target for every
