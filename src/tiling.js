@@ -12,7 +12,7 @@ import * as Logger from './logger.js';
 import * as constants from './constants.js';
 import {TileZone} from './constants.js';
 import * as WindowState from './windowState.js';
-import {ComputedLayouts, MosaicModel} from './mosaicModel.js';
+import {MosaicModel} from './mosaicModel.js';
 import {
     IS_MINIATURE,
     MINIATURE_SCALE,
@@ -22,7 +22,7 @@ import {
 } from './windowState.js';
 import {getMiniatureSize, placeMiniatureAt} from './miniature.js';
 import {isWindowAlive} from './liveness.js';
-import {orderWindowsByMru, planResizeFit} from './layoutPlanning.js';
+import {enumerateTileSlots, orderWindowsByMru, planResizeFit} from './layoutPlanning.js';
 import {getSlowDownFactor, monotonicNow} from './timing.js';
 
 // Every ordered composition of n into 1..n groups (n=3 gives [3],[2,1],[1,2],[1,1,1]).
@@ -1895,186 +1895,64 @@ export const TilingManager = GObject.registerClass(
                 (this._pendingMiniatureWindows ?? []).map(p => p.window.get_id())
             );
 
-            const levels = tile_info.levels;
-            const _y = tile_info.y;
-
             const windowLayouts = [];
             // Windows this pass places but must not touch: pending miniatures (createMiniature owns
             // their visual animation) and whatever is under the grab (the cursor owns its position).
             // A first placement sibling still needs to know they're there to compute a slide-in
             // direction against, so animateReTiling sees them without animating them.
             const miniLayouts = [];
+            const windowsById = new Map(meta_windows.map(window => [window.get_id(), window]));
+            const plannedSlots = enumerateTileSlots(tile_info, work_area, constants.WINDOW_SPACING);
 
-            if (!tile_info.vertical) {
-                let y = _y;
-                for (const level of levels) {
-                    let x = level.x;
-                    for (const windowDesc of level.windows) {
-                        const center_offset =
-                            work_area.height / 2 + work_area.y - (y + windowDesc.height / 2);
-                        let y_offset = 0;
-                        if (center_offset > 0)
-                            y_offset = Math.min(center_offset, level.height - windowDesc.height);
+            for (const {descriptor, orientation, rect: slot} of plannedSlots) {
+                const window = windowsById.get(descriptor.id);
+                if (!window) continue;
 
-                        const window = meta_windows.find(w => w.get_id() === windowDesc.id);
-                        if (window) {
-                            if (WindowState.get(window, IS_MINIATURE)) {
-                                // Do NOT move_frame for miniatures (Mutter may reject)
-                                const sc = WindowState.get(window, MINIATURE_SCALE) ?? 1;
-                                const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
-                                const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
-                                const tx = x;
-                                const ty = y + y_offset;
-                                placeMiniatureAt(window, tx, ty, {
-                                    animate: true,
-                                    duration: constants.ANIMATION_DURATION_MS,
-                                });
-                                // MosaicLayoutStrategy reads ComputedLayouts for the overview slot, so keep it in sync.
-                                const miniSlot = {
-                                    x: tx,
-                                    y: ty,
-                                    width: windowDesc.width,
-                                    height: windowDesc.height,
-                                };
-                                MosaicModel.setSlot(window, miniSlot, workspace, monitor);
-                                if (slotsOut) slotsOut.set(window.get_id(), miniSlot);
-                                Logger.log(
-                                    `[MINIATURE] animateTile H ${window.get_id()}: target=(${tx},${ty}) scale=${sc.toFixed(4)} extLeft=${extL} extTop=${extT} size=${windowDesc.width}x${windowDesc.height}`
-                                );
-                            } else if (windowDesc.id === resizingWindowId) {
-                                window.move_frame(false, x, y + y_offset);
-                            } else if (pendingMiniIds.has(window.get_id())) {
-                                // Pending miniature: capture slot, but skip animateReTiling.
-                                // createMiniature handles all visual animation; concurrent
-                                // move_resize_frame would shift actor mid-animation.
-                                const slot = {
-                                    x,
-                                    y: y + y_offset,
-                                    width: windowDesc.width,
-                                    height: windowDesc.height,
-                                };
-                                MosaicModel.setSlot(window, slot, workspace, monitor);
-                                if (slotsOut) slotsOut.set(window.get_id(), slot);
-                                miniLayouts.push({window, rect: slot});
-                                Logger.log(
-                                    `[LAYOUT] H pending-mini ${window.get_id()}: slot=(${slot.x},${slot.y}) size=${slot.width}x${slot.height}`
-                                );
-                            } else if (window.get_id() === this._grabbedWindowId) {
-                                // Mutter's grab wins every frame, so a move_resize_frame here just yanks the
-                                // window off the cursor and snaps back. Claim the slot; the drop lands in it.
-                                const slot = {
-                                    x,
-                                    y: y + y_offset,
-                                    width: windowDesc.width,
-                                    height: windowDesc.height,
-                                };
-                                MosaicModel.setSlot(window, slot, workspace, monitor);
-                                if (slotsOut) slotsOut.set(window.get_id(), slot);
-                                miniLayouts.push({window, rect: slot});
-                                Logger.log(
-                                    `[LAYOUT] H grabbed ${window.get_id()}: slot=(${slot.x},${slot.y}) size=${slot.width}x${slot.height}`
-                                );
-                            } else {
-                                Logger.log(
-                                    `[LAYOUT] H window ${window.get_id()}: target=(${x},${y + y_offset}) size=${windowDesc.width}x${windowDesc.height}`
-                                );
-                                const slot = {
-                                    x,
-                                    y: y + y_offset,
-                                    width: windowDesc.width,
-                                    height: windowDesc.height,
-                                };
-                                MosaicModel.setSlot(window, slot, workspace, monitor);
-                                if (slotsOut) slotsOut.set(window.get_id(), slot);
-                                windowLayouts.push({window, rect: slot});
-                            }
-                        }
-                        x += windowDesc.width + constants.WINDOW_SPACING;
-                    }
-                    y += level.height + constants.WINDOW_SPACING;
+                const windowId = window.get_id();
+                if (WindowState.get(window, IS_MINIATURE)) {
+                    // Do NOT move_frame for miniatures (Mutter may reject).
+                    const sc = WindowState.get(window, MINIATURE_SCALE) ?? 1;
+                    const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
+                    const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
+                    placeMiniatureAt(window, slot.x, slot.y, {
+                        animate: true,
+                        duration: constants.ANIMATION_DURATION_MS,
+                    });
+                    // MosaicLayoutStrategy reads MosaicModel for the overview slot, so keep it in sync.
+                    MosaicModel.setSlot(window, slot, workspace, monitor);
+                    if (slotsOut) slotsOut.set(windowId, slot);
+                    const sizeLabel = orientation === 'V' ? 'slotSize' : 'size';
+                    Logger.log(
+                        `[MINIATURE] animateTile ${orientation} ${windowId}: target=(${slot.x},${slot.y}) scale=${sc.toFixed(4)} extLeft=${extL} extTop=${extT} ${sizeLabel}=${slot.width}x${slot.height}`
+                    );
+                    continue;
                 }
-            } else {
-                let x = tile_info.x;
-                for (const level of levels) {
-                    let y = level.y;
-                    for (const windowDesc of level.windows) {
-                        const targetX = windowDesc.targetX !== undefined ? windowDesc.targetX : x;
-                        const targetY = windowDesc.targetY !== undefined ? windowDesc.targetY : y;
 
-                        const window = meta_windows.find(w => w.get_id() === windowDesc.id);
-                        if (window) {
-                            if (WindowState.get(window, IS_MINIATURE)) {
-                                // Do NOT move_frame for miniatures (Mutter may reject)
-                                const sc = WindowState.get(window, MINIATURE_SCALE) ?? 1;
-                                const extL = WindowState.get(window, MINIATURE_EXT_LEFT) ?? 0;
-                                const extT = WindowState.get(window, MINIATURE_EXT_TOP) ?? 0;
-                                placeMiniatureAt(window, targetX, targetY, {
-                                    animate: true,
-                                    duration: constants.ANIMATION_DURATION_MS,
-                                });
-                                // MosaicLayoutStrategy reads ComputedLayouts for the overview slot, so keep it in sync.
-                                const miniSlot = {
-                                    x: targetX,
-                                    y: targetY,
-                                    width: windowDesc.width,
-                                    height: windowDesc.height,
-                                };
-                                MosaicModel.setSlot(window, miniSlot, workspace, monitor);
-                                if (slotsOut) slotsOut.set(window.get_id(), miniSlot);
-                                Logger.log(
-                                    `[MINIATURE] animateTile V ${window.get_id()}: target=(${targetX},${targetY}) scale=${sc.toFixed(4)} extLeft=${extL} extTop=${extT} slotSize=${windowDesc.width}x${windowDesc.height}`
-                                );
-                            } else if (windowDesc.id === resizingWindowId) {
-                                window.move_frame(false, targetX, targetY);
-                            } else if (pendingMiniIds.has(window.get_id())) {
-                                // Pending miniature: capture slot, but skip animateReTiling.
-                                // createMiniature handles all visual animation; concurrent
-                                // move_resize_frame would shift actor mid-animation.
-                                const slot = {
-                                    x: targetX,
-                                    y: targetY,
-                                    width: windowDesc.width,
-                                    height: windowDesc.height,
-                                };
-                                MosaicModel.setSlot(window, slot, workspace, monitor);
-                                if (slotsOut) slotsOut.set(window.get_id(), slot);
-                                miniLayouts.push({window, rect: slot});
-                                Logger.log(
-                                    `[LAYOUT] V pending-mini ${window.get_id()}: slot=(${slot.x},${slot.y}) size=${slot.width}x${slot.height}`
-                                );
-                            } else if (window.get_id() === this._grabbedWindowId) {
-                                // Mutter's grab wins every frame, so a move_resize_frame here just yanks the
-                                // window off the cursor and snaps back. Claim the slot; the drop lands in it.
-                                const slot = {
-                                    x: targetX,
-                                    y: targetY,
-                                    width: windowDesc.width,
-                                    height: windowDesc.height,
-                                };
-                                MosaicModel.setSlot(window, slot, workspace, monitor);
-                                if (slotsOut) slotsOut.set(window.get_id(), slot);
-                                miniLayouts.push({window, rect: slot});
-                                Logger.log(
-                                    `[LAYOUT] V grabbed ${window.get_id()}: slot=(${slot.x},${slot.y}) size=${slot.width}x${slot.height}`
-                                );
-                            } else {
-                                Logger.log(
-                                    `[LAYOUT] V window ${window.get_id()}: target=(${targetX},${targetY}) size=${windowDesc.width}x${windowDesc.height}`
-                                );
-                                const slot = {
-                                    x: targetX,
-                                    y: targetY,
-                                    width: windowDesc.width,
-                                    height: windowDesc.height,
-                                };
-                                MosaicModel.setSlot(window, slot, workspace, monitor);
-                                if (slotsOut) slotsOut.set(window.get_id(), slot);
-                                windowLayouts.push({window, rect: slot});
-                            }
-                        }
-                        y += windowDesc.height + constants.WINDOW_SPACING;
-                    }
-                    x += level.width + constants.WINDOW_SPACING;
+                if (descriptor.id === resizingWindowId) {
+                    window.move_frame(false, slot.x, slot.y);
+                    continue;
+                }
+
+                MosaicModel.setSlot(window, slot, workspace, monitor);
+                if (slotsOut) slotsOut.set(windowId, slot);
+
+                const heldKind = pendingMiniIds.has(windowId)
+                    ? 'pending-mini'
+                    : windowId === this._grabbedWindowId
+                      ? 'grabbed'
+                      : null;
+                if (heldKind) {
+                    // Pending miniatures own their visual animation, while Mutter owns a grabbed
+                    // window's position. Both still participate in entrance-direction planning.
+                    miniLayouts.push({window, rect: slot});
+                    Logger.log(
+                        `[LAYOUT] ${orientation} ${heldKind} ${windowId}: slot=(${slot.x},${slot.y}) size=${slot.width}x${slot.height}`
+                    );
+                } else {
+                    Logger.log(
+                        `[LAYOUT] ${orientation} window ${windowId}: target=(${slot.x},${slot.y}) size=${slot.width}x${slot.height}`
+                    );
+                    windowLayouts.push({window, rect: slot});
                 }
             }
 
@@ -2106,74 +1984,6 @@ export const TilingManager = GObject.registerClass(
             }
 
             return true;
-        }
-
-        cascadeWorkspaceWindows(workspace) {
-            if (!workspace || workspace.index() < 0) return;
-
-            const nMonitors = global.display.get_n_monitors();
-            for (let monitor = 0; monitor < nMonitors; monitor++) {
-                this._cascadeMonitorWindows(workspace, monitor);
-            }
-        }
-
-        _cascadeMonitorWindows(workspace, monitor) {
-            const workArea = this._clampedWorkArea(workspace, monitor);
-            if (!workArea || workArea.width <= 0) return;
-
-            const windows =
-                this._windowingManager
-                    ?.getMonitorWorkspaceWindows(workspace, monitor)
-                    .filter(w => !this._windowingManager.isMaximizedOrFullscreen(w)) ?? [];
-
-            if (windows.length === 0) return;
-
-            windows.sort((a, b) => {
-                const fa = a.get_frame_rect(),
-                    fb = b.get_frame_rect();
-                return fb.width * fb.height - fa.width * fa.height;
-            });
-
-            const OFFSET = 56;
-
-            const frames = windows.map(w => w.get_frame_rect());
-            const relPositions = frames.map((f, i) => ({
-                x: i * OFFSET,
-                y: i * OFFSET,
-                w: f.width,
-                h: f.height,
-            }));
-
-            const groupW = Math.max(...relPositions.map(p => p.x + p.w));
-            const groupH = Math.max(...relPositions.map(p => p.y + p.h));
-
-            const originX = workArea.x + Math.max(0, Math.round((workArea.width - groupW) / 2));
-            const originY = workArea.y + Math.max(0, Math.round((workArea.height - groupH) / 2));
-
-            Logger.log(
-                `[CASCADE] workArea=(${workArea.x},${workArea.y} ${workArea.width}x${workArea.height}) group=(${groupW}x${groupH}) origin=(${originX},${originY}) windows=${windows.length}`
-            );
-
-            const layouts = windows.map((w, i) => {
-                const p = relPositions[i];
-                const x = Math.min(originX + p.x, workArea.x + workArea.width - p.w);
-                const y = Math.min(originY + p.y, workArea.y + workArea.height - p.h);
-                Logger.log(
-                    `[CASCADE] w=${w.get_id()} frame=(${frames[i].x},${frames[i].y} ${p.w}x${p.h}) -> (${x},${y})`
-                );
-                return {window: w, rect: {x, y, width: p.w, height: p.h}};
-            });
-
-            // Raise from largest (back) to smallest (front) to establish visual stacking order.
-            for (const w of windows) {
-                w.raise();
-            }
-            // Focus the smallest window so it appears on top and is ready to interact with.
-            // Only on the active workspace, since activate() on a background one drags the shell over to it.
-            if (workspace === global.workspace_manager.get_active_workspace())
-                windows[windows.length - 1].activate(global.get_current_time());
-
-            this._animationsManager?.animateReTiling(layouts);
         }
 
         // Re-apply mosaic from scratch with smart-resize + miniaturization. Used on
@@ -2498,7 +2308,7 @@ export const TilingManager = GObject.registerClass(
             }
 
             // Computed slots from this pass, returned to the caller so it can find
-            // miniature positions without depending on the ComputedLayouts side-channel.
+            // miniature positions without depending on MosaicModel lookups.
             const computedSlots = new Map();
 
             const tileArea =
@@ -2523,7 +2333,7 @@ export const TilingManager = GObject.registerClass(
             );
             for (const w of meta_windows) {
                 const id = w.get_id();
-                const committedSlot = ComputedLayouts.get(w);
+                const committedSlot = MosaicModel.slotFor(w);
                 let f = committedSlot ?? w.get_frame_rect();
 
                 // Spawn coordinates and a slot committed on another monitor are not
@@ -2620,11 +2430,7 @@ export const TilingManager = GObject.registerClass(
                 // This prevents incorrectly expelling existing windows during resize retiling
                 const isNewlyAdded = this._isArrivalPending(reference_meta_window);
 
-                if (
-                    !isNewlyAdded &&
-                    !WindowState.get(reference_meta_window, 'forceOverflow') &&
-                    !WindowState.get(reference_meta_window, 'isRestoringSacred')
-                ) {
+                if (!isNewlyAdded && !WindowState.get(reference_meta_window, 'isRestoringSacred')) {
                     Logger.log(
                         `Skipping overflow for ${reference_meta_window.get_id()} - not a new window`
                     );
@@ -4063,7 +3869,7 @@ export const TilingManager = GObject.registerClass(
 
         destroy() {
             this.destroyMasks();
-            ComputedLayouts.clear();
+            MosaicModel.clear();
             this._isSmartResizingBlocked = false;
             this._restoringWindowId = null;
             this._layoutHistory = null;

@@ -83,31 +83,7 @@ export const MosaicModel = {
         if (id !== undefined) entries.delete(id);
     },
 
-    forgetById(id) {
-        entries.delete(id);
-    },
-
     clear() {
         entries.clear();
-    },
-};
-
-// Preserve the existing API for lifecycle call sites while moving storage into
-// the workspace/monitor-aware model.
-export const ComputedLayouts = {
-    get(window) {
-        return MosaicModel.slotFor(window) ?? undefined;
-    },
-    set(window, layout) {
-        MosaicModel.setSlot(window, layout, window?.get_workspace?.(), window?.get_monitor?.());
-    },
-    delete(window) {
-        MosaicModel.forget(window);
-    },
-    deleteById(id) {
-        MosaicModel.forgetById(id);
-    },
-    clear() {
-        MosaicModel.clear();
     },
 };

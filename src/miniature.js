@@ -937,15 +937,6 @@ export const MiniatureManager = GObject.registerClass(
             }
         }
 
-        restoreWorkspaceMiniatures(workspace) {
-            const windows = global.display
-                .get_tab_list(Meta.TabList.NORMAL, workspace)
-                .filter(w => WindowState.get(w, IS_MINIATURE));
-            for (const window of windows) {
-                this.restoreMiniature(window, null, {activate: false});
-            }
-        }
-
         // Screenshot grabs actor straight off stage; snap miniature back to full size first.
         pauseForScreenshot() {
             const windows = global.display

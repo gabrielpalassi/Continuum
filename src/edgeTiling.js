@@ -531,7 +531,7 @@ export const EdgeTilingManager = GObject.registerClass(
             const state = WindowState.get(window, 'edgeTilingState');
 
             // If this was a quarter tile, expand the adjacent quarter to FULL
-            if (state && state.zone && this._isQuarterZone(state.zone)) {
+            if (state && state.zone && this.isQuarterZone(state.zone)) {
                 Logger.log(`Quarter tile ${winId} being removed from zone ${state.zone}`);
 
                 const adjacentZone = this._getAdjacentQuarterZone(state.zone);
@@ -678,17 +678,13 @@ export const EdgeTilingManager = GObject.registerClass(
             }
         }
 
-        _isQuarterZone(zone) {
+        isQuarterZone(zone) {
             return (
                 zone === TileZone.TOP_LEFT ||
                 zone === TileZone.BOTTOM_LEFT ||
                 zone === TileZone.TOP_RIGHT ||
                 zone === TileZone.BOTTOM_RIGHT
             );
-        }
-
-        isQuarterZone(zone) {
-            return this._isQuarterZone(zone);
         }
 
         _getAdjacentQuarterZone(zone) {
@@ -1102,7 +1098,7 @@ export const EdgeTilingManager = GObject.registerClass(
                 WindowState.remove(window, 'autoTileMaster');
             }
 
-            if (this._isQuarterZone(savedZone)) {
+            if (this.isQuarterZone(savedZone)) {
                 Logger.log(`Quarter tile ${winId} being removed from zone ${savedZone}`);
 
                 const adjacentZone = this._getAdjacentQuarterZone(savedZone);
@@ -1322,7 +1318,7 @@ export const EdgeTilingManager = GObject.registerClass(
 
             if (state.zone === TileZone.LEFT_FULL || state.zone === TileZone.RIGHT_FULL) {
                 this._handleHorizontalResize(window, state.zone);
-            } else if (this._isQuarterZone(state.zone)) {
+            } else if (this.isQuarterZone(state.zone)) {
                 this._handleVerticalResize(window, state.zone);
             }
         }
@@ -1965,12 +1961,3 @@ export const EdgeTilingManager = GObject.registerClass(
         }
     }
 );
-
-export function isQuarterZone(zone) {
-    return (
-        zone === TileZone.TOP_LEFT ||
-        zone === TileZone.BOTTOM_LEFT ||
-        zone === TileZone.TOP_RIGHT ||
-        zone === TileZone.BOTTOM_RIGHT
-    );
-}

@@ -20,15 +20,13 @@ import {WindowingManager} from './windowing.js';
 import * as constants from './constants.js';
 import {SettingsOverrider} from './settingsOverrider.js';
 import {EdgeTilingManager} from './edgeTiling.js';
-import {TileZone} from './constants.js';
 import {TilingManager} from './tiling.js';
 import {isWindowAlive, isWorkspaceAlive} from './liveness.js';
 import {ReorderingManager} from './reordering.js';
 import {SwappingManager} from './swapping.js';
 import {DrawingManager} from './drawing.js';
 import {AnimationsManager} from './animations.js';
-import {MosaicLayoutStrategy} from './overviewLayout.js';
-import {MosaicRenderer} from './mosaicRenderer.js';
+import {MosaicLayoutStrategy, MosaicRenderer} from './mosaicRenderer.js';
 import {TimeoutRegistry, createDebounced} from './timing.js';
 import {WindowHandler} from './windowHandler.js';
 import {DragHandler} from './dragHandler.js';
@@ -176,20 +174,15 @@ export default class ContinuumExtension extends Extension {
         this.drawingManager = new DrawingManager();
         this.animationsManager = new AnimationsManager();
         this.mosaicRenderer = new MosaicRenderer();
-        this.windowingManager = new WindowingManager();
-
-        this.windowingManager.setEdgeTilingManager(this.edgeTilingManager);
-        this.windowingManager.setAnimationsManager(this.animationsManager);
-        this.windowingManager.setTilingManager(this.tilingManager);
-        this.windowingManager.setTimeoutRegistry(this._timeoutRegistry);
-        this.windowingManager.setOverflowCallbacks(
-            () => {
-                this._overflowInProgress = true;
+        this.windowingManager = new WindowingManager({
+            edgeTilingManager: this.edgeTilingManager,
+            animationsManager: this.animationsManager,
+            tilingManager: this.tilingManager,
+            timeoutRegistry: this._timeoutRegistry,
+            onOverflowChange: inProgress => {
+                this._overflowInProgress = inProgress;
             },
-            () => {
-                this._overflowInProgress = false;
-            }
-        );
+        });
 
         this.tilingManager.setEdgeTilingManager(this.edgeTilingManager);
         this.tilingManager.setDrawingManager(this.drawingManager);
@@ -877,89 +870,20 @@ export default class ContinuumExtension extends Extension {
     _setupKeybindings() {
         const settings = this.getSettings('org.gnome.shell.extensions.continuum');
 
-        Main.wm.addKeybinding(
-            'tile-left',
-            settings,
-            Meta.KeyBindingFlags.NONE,
-            Shell.ActionMode.NORMAL,
-            () => this._tileActiveWindow(TileZone.LEFT_FULL)
-        );
-
-        Main.wm.addKeybinding(
-            'tile-right',
-            settings,
-            Meta.KeyBindingFlags.NONE,
-            Shell.ActionMode.NORMAL,
-            () => this._tileActiveWindow(TileZone.RIGHT_FULL)
-        );
-
-        Main.wm.addKeybinding(
-            'tile-top-left',
-            settings,
-            Meta.KeyBindingFlags.NONE,
-            Shell.ActionMode.NORMAL,
-            () => this._tileActiveWindow(TileZone.TOP_LEFT)
-        );
-
-        Main.wm.addKeybinding(
-            'tile-top-right',
-            settings,
-            Meta.KeyBindingFlags.NONE,
-            Shell.ActionMode.NORMAL,
-            () => this._tileActiveWindow(TileZone.TOP_RIGHT)
-        );
-
-        Main.wm.addKeybinding(
-            'tile-bottom-left',
-            settings,
-            Meta.KeyBindingFlags.NONE,
-            Shell.ActionMode.NORMAL,
-            () => this._tileActiveWindow(TileZone.BOTTOM_LEFT)
-        );
-
-        Main.wm.addKeybinding(
-            'tile-bottom-right',
-            settings,
-            Meta.KeyBindingFlags.NONE,
-            Shell.ActionMode.NORMAL,
-            () => this._tileActiveWindow(TileZone.BOTTOM_RIGHT)
-        );
-
-        Logger.log('Registering swap-left keybinding');
-        Main.wm.addKeybinding(
-            'swap-left',
-            settings,
-            Meta.KeyBindingFlags.NONE,
-            Shell.ActionMode.NORMAL,
-            () => this._swapActiveWindow('left')
-        );
-
-        Logger.log('Registering swap-right keybinding');
-        Main.wm.addKeybinding(
-            'swap-right',
-            settings,
-            Meta.KeyBindingFlags.NONE,
-            Shell.ActionMode.NORMAL,
-            () => this._swapActiveWindow('right')
-        );
-
-        Logger.log('Registering swap-up keybinding');
-        Main.wm.addKeybinding(
-            'swap-up',
-            settings,
-            Meta.KeyBindingFlags.NONE,
-            Shell.ActionMode.NORMAL,
-            () => this._swapActiveWindow('up')
-        );
-
-        Logger.log('Registering swap-down keybinding');
-        Main.wm.addKeybinding(
-            'swap-down',
-            settings,
-            Meta.KeyBindingFlags.NONE,
-            Shell.ActionMode.NORMAL,
-            () => this._swapActiveWindow('down')
-        );
+        for (const [name, kind, value] of constants.KEYBINDING_ACTIONS) {
+            if (kind === 'swap') Logger.log(`Registering ${name} keybinding`);
+            const handler =
+                kind === 'tile'
+                    ? () => this._tileActiveWindow(value)
+                    : () => this._swapActiveWindow(value);
+            Main.wm.addKeybinding(
+                name,
+                settings,
+                Meta.KeyBindingFlags.NONE,
+                Shell.ActionMode.NORMAL,
+                handler
+            );
+        }
 
         Logger.log('All swap keybindings registered successfully');
         Logger.log('Keyboard shortcuts registered');
@@ -1044,16 +968,7 @@ export default class ContinuumExtension extends Extension {
             this._origWindowPreviewBoundingBoxDesc = null;
         }
 
-        Main.wm.removeKeybinding('tile-left');
-        Main.wm.removeKeybinding('tile-right');
-        Main.wm.removeKeybinding('tile-top-left');
-        Main.wm.removeKeybinding('tile-top-right');
-        Main.wm.removeKeybinding('tile-bottom-left');
-        Main.wm.removeKeybinding('tile-bottom-right');
-        Main.wm.removeKeybinding('swap-left');
-        Main.wm.removeKeybinding('swap-right');
-        Main.wm.removeKeybinding('swap-up');
-        Main.wm.removeKeybinding('swap-down');
+        for (const [name] of constants.KEYBINDING_ACTIONS) Main.wm.removeKeybinding(name);
         Logger.log('Keyboard shortcuts removed');
 
         if (this.edgeTilingManager) this.edgeTilingManager.destroy();

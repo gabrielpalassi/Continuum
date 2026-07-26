@@ -34,10 +34,6 @@ export function remove(window, property) {
     }
 }
 
-export function getState(window) {
-    return windowStates.get(window);
-}
-
 export function clear(window) {
     windowStates.delete(window);
 }

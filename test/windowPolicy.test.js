@@ -40,7 +40,8 @@ test('clearing a window removes all state without affecting another window', () 
 
     WindowState.clear(first);
 
-    assert.equal(WindowState.getState(first), undefined);
+    assert.equal(WindowState.get(first, 'one'), undefined);
+    assert.equal(WindowState.get(first, 'two'), undefined);
     assert.equal(WindowState.get(second, 'one'), 3);
 });
 

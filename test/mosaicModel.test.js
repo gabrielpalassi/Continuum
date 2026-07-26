@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {ComputedLayouts, MosaicModel} from '../src/mosaicModel.js';
+import {MosaicModel} from '../src/mosaicModel.js';
 
 const workspace = index => ({index: () => index});
 const windowWith = (id, frame = null, workspaceIndex = 0, monitor = 0) => ({
@@ -147,29 +147,13 @@ test('invalid computed slots are rejected instead of becoming renderer geometry'
     );
 });
 
-test('forgetting by wrapper or ID removes stale layout intent', () => {
+test('forgetting a window removes stale layout intent', () => {
     const first = windowWith(30);
-    const second = windowWith(31);
     MosaicModel.setSlot(first, {x: 0, y: 0, width: 10, height: 10}, workspace(0), 0);
-    MosaicModel.setSlot(second, {x: 10, y: 0, width: 10, height: 10}, workspace(0), 0);
 
     MosaicModel.forget(first);
-    MosaicModel.forgetById(31);
 
     assert.equal(MosaicModel.slotFor(first), null);
-    assert.equal(MosaicModel.slotFor(second), null);
-});
-
-test('legacy computed-layout API records current workspace and monitor ownership', () => {
-    const window = windowWith(40, null, 3, 2);
-    const slot = {x: 20, y: 30, width: 400, height: 300};
-
-    ComputedLayouts.set(window, slot);
-
-    assert.deepEqual(ComputedLayouts.get(window), slot);
-    assert.deepEqual(MosaicModel.entriesFor(workspace(3), 2), [{window, slot}]);
-    ComputedLayouts.deleteById(40);
-    assert.equal(ComputedLayouts.get(window), undefined);
 });
 
 test('reusing a window ID refreshes its wrapper, workspace, and monitor ownership atomically', () => {

@@ -6,6 +6,7 @@ import {readFile} from 'node:fs/promises';
 import test from 'node:test';
 import {URL} from 'node:url';
 import {promisify} from 'node:util';
+import {KEYBINDING_ACTIONS, TileZone} from '../src/constants.js';
 
 const schemaPath = new URL(
     '../src/schemas/org.gnome.shell.extensions.continuum.gschema.xml',
@@ -27,6 +28,19 @@ const expectedBindings = new Map([
     ['swap-down', '<Super><Alt>Down'],
 ]);
 
+const expectedActions = new Map([
+    ['tile-left', ['tile', TileZone.LEFT_FULL]],
+    ['tile-right', ['tile', TileZone.RIGHT_FULL]],
+    ['tile-top-left', ['tile', TileZone.TOP_LEFT]],
+    ['tile-top-right', ['tile', TileZone.TOP_RIGHT]],
+    ['tile-bottom-left', ['tile', TileZone.BOTTOM_LEFT]],
+    ['tile-bottom-right', ['tile', TileZone.BOTTOM_RIGHT]],
+    ['swap-left', ['swap', 'left']],
+    ['swap-right', ['swap', 'right']],
+    ['swap-up', ['swap', 'up']],
+    ['swap-down', ['swap', 'down']],
+]);
+
 function keyDefaults(xml) {
     const defaults = new Map();
     const keyPattern =
@@ -41,6 +55,15 @@ function keyDefaults(xml) {
 test('all documented tiling and swapping actions have their intended default shortcut', async () => {
     const defaults = keyDefaults(await readFile(schemaPath, 'utf8'));
     assert.deepEqual(defaults, expectedBindings);
+});
+
+test('runtime keybinding actions match the documented schema actions', () => {
+    const runtimeActions = new Map(
+        KEYBINDING_ACTIONS.map(([name, kind, value]) => [name, [kind, value]])
+    );
+
+    assert.deepEqual(runtimeActions, expectedActions);
+    assert.deepEqual([...runtimeActions.keys()], [...expectedBindings.keys()]);
 });
 
 test('default shortcuts are unique', async () => {

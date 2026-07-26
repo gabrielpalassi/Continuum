@@ -2,7 +2,12 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {orderWindowsByMru, planResizeFit, restoreBeforeRearrange} from '../src/layoutPlanning.js';
+import {
+    enumerateTileSlots,
+    orderWindowsByMru,
+    planResizeFit,
+    restoreBeforeRearrange,
+} from '../src/layoutPlanning.js';
 
 const windowWithId = id => ({get_id: () => id});
 
@@ -112,6 +117,84 @@ test('least-recent ordering sacrifices windows with no history before known wind
         orderWindowsByMru(windows, mru, {mostRecentFirst: false}).map(window => window.get_id()),
         [30, 20, 10]
     );
+});
+
+test('horizontal tile slots preserve shelf order, spacing, and vertical centering', () => {
+    const first = {id: 1, width: 100, height: 40};
+    const second = {id: 2, width: 80, height: 60};
+    const third = {id: 3, width: 70, height: 50};
+    const tileInfo = {
+        vertical: false,
+        y: 20,
+        levels: [
+            {x: 10, width: 188, height: 80, windows: [first, second]},
+            {x: 30, width: 70, height: 50, windows: [third]},
+        ],
+    };
+
+    assert.deepEqual(enumerateTileSlots(tileInfo, {x: 0, y: 0, width: 400, height: 240}, 8), [
+        {
+            descriptor: first,
+            orientation: 'H',
+            rect: {x: 10, y: 60, width: 100, height: 40},
+        },
+        {
+            descriptor: second,
+            orientation: 'H',
+            rect: {x: 118, y: 40, width: 80, height: 60},
+        },
+        {
+            descriptor: third,
+            orientation: 'H',
+            rect: {x: 30, y: 108, width: 70, height: 50},
+        },
+    ]);
+});
+
+test('vertical tile slots preserve shelf order and explicit target coordinates', () => {
+    const first = {id: 1, width: 100, height: 40};
+    const second = {id: 2, width: 80, height: 60, targetX: 175, targetY: 95};
+    const third = {id: 3, width: 70, height: 50};
+    const tileInfo = {
+        vertical: true,
+        x: 20,
+        levels: [
+            {y: 10, width: 120, height: 108, windows: [first, second]},
+            {y: 30, width: 70, height: 50, windows: [third]},
+        ],
+    };
+
+    assert.deepEqual(enumerateTileSlots(tileInfo, {x: 0, y: 0, width: 400, height: 240}, 8), [
+        {
+            descriptor: first,
+            orientation: 'V',
+            rect: {x: 20, y: 10, width: 100, height: 40},
+        },
+        {
+            descriptor: second,
+            orientation: 'V',
+            rect: {x: 175, y: 95, width: 80, height: 60},
+        },
+        {
+            descriptor: third,
+            orientation: 'V',
+            rect: {x: 148, y: 30, width: 70, height: 50},
+        },
+    ]);
+});
+
+test('tile slot enumeration does not mutate layout descriptors', () => {
+    const descriptor = {id: 1, width: 100, height: 40, targetX: 25};
+    const tileInfo = {
+        vertical: true,
+        x: 20,
+        levels: [{y: 10, width: 100, height: 40, windows: [descriptor]}],
+    };
+    const original = JSON.parse(JSON.stringify(tileInfo));
+
+    enumerateTileSlots(tileInfo, {x: 0, y: 0, width: 400, height: 240}, 8);
+
+    assert.deepEqual(tileInfo, original);
 });
 
 test('MRU ordering remains deterministic when cached ranks are stale or non-finite', () => {
