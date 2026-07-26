@@ -28,7 +28,8 @@ import {SwappingManager} from './swapping.js';
 import {DrawingManager} from './drawing.js';
 import {AnimationsManager} from './animations.js';
 import {MosaicLayoutStrategy} from './overviewLayout.js';
-import {TimeoutRegistry, createDebounced, afterOverviewHidden} from './timing.js';
+import {MosaicRenderer} from './mosaicRenderer.js';
+import {TimeoutRegistry, createDebounced} from './timing.js';
 import {WindowHandler} from './windowHandler.js';
 import {DragHandler} from './dragHandler.js';
 import {ResizeHandler} from './resizeHandler.js';
@@ -67,6 +68,7 @@ export default class ContinuumExtension extends Extension {
         this.swappingManager = null;
         this.drawingManager = null;
         this.animationsManager = null;
+        this.mosaicRenderer = null;
         this.windowingManager = null;
 
         this.windowHandler = null;
@@ -111,6 +113,17 @@ export default class ContinuumExtension extends Extension {
                 this.tilingManager.enforceWorkspaceFit(workspace, j);
         }
     };
+
+    _flushMosaicToWindows() {
+        const nWorkspaces = this._workspaceManager.get_n_workspaces();
+        const nMonitors = global.display.get_n_monitors();
+
+        for (let workspaceIndex = 0; workspaceIndex < nWorkspaces; workspaceIndex++) {
+            const workspace = this._workspaceManager.get_workspace_by_index(workspaceIndex);
+            for (let monitor = 0; monitor < nMonitors; monitor++)
+                this.mosaicRenderer?.flushToWindows(workspace, monitor);
+        }
+    }
 
     _workspaceAddSignal = (_, workspaceIdx) => {
         const workspace = this._workspaceManager.get_workspace_by_index(workspaceIdx);
@@ -162,6 +175,7 @@ export default class ContinuumExtension extends Extension {
         this.swappingManager = new SwappingManager();
         this.drawingManager = new DrawingManager();
         this.animationsManager = new AnimationsManager();
+        this.mosaicRenderer = new MosaicRenderer();
         this.windowingManager = new WindowingManager();
 
         this.windowingManager.setEdgeTilingManager(this.edgeTilingManager);
@@ -529,6 +543,11 @@ export default class ContinuumExtension extends Extension {
                 }
 
                 Logger.log(`Overview: Using MOSAIC Strategy for monitor ${this._monitorIndex}`);
+                extension.mosaicRenderer?.registerOverviewLayout(
+                    workspace,
+                    this._monitorIndex,
+                    this
+                );
                 this._layoutStrategy = new MosaicLayoutStrategy({
                     monitor: Main.layoutManager.monitors[this._monitorIndex],
                 });
@@ -619,10 +638,19 @@ export default class ContinuumExtension extends Extension {
             this.animationsManager.setOverviewActive(true);
             this.miniatureManager?.setOverviewActive(true);
         });
+        // Mutter accepts geometry again as Overview starts closing. Flush here so
+        // the closing animation already reflects the model instead of stale frames.
+        this._onOverviewHidingId = Main.overview.connect('hiding', () => {
+            Logger.log('[MODEL] Flushing mosaic as Overview starts hiding');
+            this._flushMosaicToWindows();
+        });
         this._onOverviewHiddenId = Main.overview.connect('hidden', () => {
             this.animationsManager.setOverviewActive(false);
             this.miniatureManager?.setOverviewActive(false);
-            this.windowHandler.onOverviewHidden();
+            // Catch a final slot computed between the hiding and hidden signals.
+            Logger.log('[MODEL] Flushing final mosaic after Overview hidden');
+            this._flushMosaicToWindows();
+            this.mosaicRenderer?.clearOverviewLayouts();
             this.workspaceOverviewManager.onOverviewHidden();
         });
 
@@ -741,6 +769,12 @@ export default class ContinuumExtension extends Extension {
 
         const workspace = window.get_workspace();
         if (!workspace) return;
+
+        // Preview cleanup restores multiple miniatures synchronously. The drag's
+        // final retile owns their layout; running this pass for every restore can
+        // re-miniaturize them mid-cleanup and cause a retile storm.
+        if (this.dragHandler?._suppressRestoreRetile) return;
+
         const monitor = window.get_monitor();
         const workArea = this.tilingManager.getUsableWorkArea(workspace, monitor);
 
@@ -764,6 +798,7 @@ export default class ContinuumExtension extends Extension {
             window,
             existingWindows,
             workArea,
+            workspace,
             window
         );
 
@@ -808,16 +843,9 @@ export default class ContinuumExtension extends Extension {
             }
         };
 
-        // When the overview is active, tiling with pending miniatures must wait
-        // until after the exit animation, since overview.hide fires before
-        // notify::focus-window on Wayland, so _isOverviewActive is still true
-        // here. Running cascade with animate=true only after 'hidden' ensures a
-        // smooth miniaturization rather than an instant snap.
-        if (this.animationsManager._isOverviewActive) {
-            afterOverviewHidden(doTile, this._timeoutRegistry);
-        } else {
-            doTile();
-        }
+        // While Overview is open the tile pass updates the model and republishes
+        // its clone layout; hide-time flushing applies the same slots to windows.
+        doTile();
     }
 
     _onDndEnter() {
@@ -1085,6 +1113,10 @@ export default class ContinuumExtension extends Extension {
             Main.overview.disconnect(this._onOverviewShowingId);
             this._onOverviewShowingId = 0;
         }
+        if (this._onOverviewHidingId) {
+            Main.overview.disconnect(this._onOverviewHidingId);
+            this._onOverviewHidingId = 0;
+        }
         if (this._onOverviewHiddenId) {
             Main.overview.disconnect(this._onOverviewHiddenId);
             this._onOverviewHiddenId = 0;
@@ -1120,6 +1152,8 @@ export default class ContinuumExtension extends Extension {
         this.swappingManager = null;
         this.drawingManager = null;
         this.animationsManager = null;
+        this.mosaicRenderer?.destroy();
+        this.mosaicRenderer = null;
         this.windowingManager = null;
         this._timeoutRegistry = null;
         this._mutterSettings = null;

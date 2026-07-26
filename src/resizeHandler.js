@@ -13,6 +13,7 @@ import * as constants from './constants.js';
 import {TileZone} from './constants.js';
 import {isResizeGrabOp} from './grabOps.js';
 import {isWorkspaceAlive, isWindowAlive} from './liveness.js';
+import {MosaicModel} from './mosaicModel.js';
 import GObject from 'gi://GObject';
 
 export const ResizeHandler = GObject.registerClass(
@@ -630,6 +631,7 @@ export const ResizeHandler = GObject.registerClass(
                         width: rect.width,
                         height: rect.height,
                     });
+                    MosaicModel.learn(window, rect);
                     if (isConstrained) {
                         WindowState.set(window, 'isConstrainedByMosaic', false);
                         Logger.log(`Manual resize for ${window.get_id()} - cleared constraint`);
@@ -663,6 +665,7 @@ export const ResizeHandler = GObject.registerClass(
                                     width: rect.width,
                                     height: rect.height,
                                 });
+                                MosaicModel.learn(window, rect);
                                 Logger.log(
                                     `Preferred size updated (ambient): ${window.get_id()} = ${rect.width}x${rect.height}`
                                 );
@@ -672,6 +675,7 @@ export const ResizeHandler = GObject.registerClass(
                                 width: rect.width,
                                 height: rect.height,
                             });
+                            MosaicModel.learn(window, rect);
                             Logger.log(
                                 `Initial preferred size saved: ${window.get_id()} = ${rect.width}x${rect.height}`
                             );
@@ -1096,6 +1100,7 @@ export const ResizeHandler = GObject.registerClass(
                     window,
                     existingWindows,
                     this.tilingManager.getUsableWorkArea(targetWorkspace, monitor),
+                    targetWorkspace,
                     window
                 );
                 canFit = fitResult?.success ?? false;

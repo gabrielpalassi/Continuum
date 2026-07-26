@@ -34,6 +34,7 @@ export const DragHandler = GObject.registerClass(
             this._isPositionProcessing = false;
             this._currentGrabOp = null;
             this._restoringFromEdgeTile = false;
+            this._suppressRestoreRetile = false;
             this._skipNextTiling = null;
             this._lastReorderMonitor = null;
             this._awaitingUnmaximizeDrag = false;
@@ -82,10 +83,20 @@ export const DragHandler = GObject.registerClass(
         // leaving the zone (or dropping outside it) is the only thing that can hand these back.
         _restorePreviewMiniatures() {
             const miniatureManager = this._ext.miniatureManager;
-            for (const win of this._previewMiniaturizedWindows) {
-                if (!miniatureManager || !WindowState.get(win, WindowState.IS_MINIATURE)) continue;
-                Logger.log(`Edge preview cancelled - restoring miniature ${win.get_id()}`);
-                miniatureManager.restoreMiniature(win, null, {activate: false});
+            // restoreMiniature emits synchronously. Retiling after each restore can
+            // re-miniaturize the same window while the drag is still active and turn
+            // preview cleanup into an unbounded restore/retile loop. The drop owns the
+            // authoritative retile, so suppress the per-restore pass here.
+            this._suppressRestoreRetile = true;
+            try {
+                for (const win of this._previewMiniaturizedWindows) {
+                    if (!miniatureManager || !WindowState.get(win, WindowState.IS_MINIATURE))
+                        continue;
+                    Logger.log(`Edge preview cancelled - restoring miniature ${win.get_id()}`);
+                    miniatureManager.restoreMiniature(win, null, {activate: false});
+                }
+            } finally {
+                this._suppressRestoreRetile = false;
             }
             this._previewMiniaturizedWindows = [];
         }
@@ -125,7 +136,10 @@ export const DragHandler = GObject.registerClass(
                 if (!this._miniatureCreatedId && this._ext.miniatureManager) {
                     this._miniatureCreatedId = this._ext.miniatureManager.connect(
                         'miniature-created',
-                        (_mgr, win) => this._previewMiniaturizedWindows.push(win)
+                        (_mgr, win) => {
+                            if (!this._previewMiniaturizedWindows.includes(win))
+                                this._previewMiniaturizedWindows.push(win);
+                        }
                     );
                 }
 
@@ -694,6 +708,7 @@ export const DragHandler = GObject.registerClass(
             this._draggedWindow = null;
             this._currentZone = null;
             this._restoringFromEdgeTile = false;
+            this._suppressRestoreRetile = false;
             this._isPositionProcessing = false;
             this._currentGrabOp = null;
             this._awaitingUnmaximizeDrag = false;

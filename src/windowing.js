@@ -69,6 +69,16 @@ export const WindowingManager = GObject.registerClass(
             return global.workspace_manager.get_active_workspace();
         }
 
+        // Always pass a workspace: the null path drops Mutter's real MRU list and
+        // falls back to sorting by the coarser user_time.
+        getMRUOrder(workspace) {
+            const order = new Map();
+            global.display
+                .get_tab_list(Meta.TabList.NORMAL, workspace)
+                .forEach((window, index) => order.set(window.get_id(), index));
+            return order;
+        }
+
         invalidateWindowsCache() {
             this._cacheVersion = (this._cacheVersion || 0) + 1;
         }

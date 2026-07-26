@@ -6,7 +6,6 @@
 
 import GLib from 'gi://GLib';
 import St from 'gi://St';
-import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Logger from './logger.js';
 
 const FALLBACK_ANIMATION_MS = 250;
@@ -181,39 +180,6 @@ export function afterWindowClose(callback, registry) {
     const duration = FALLBACK_ANIMATION_MS * getSlowDownFactor();
     registry.add(duration + 50, () => {
         callback();
-        return GLib.SOURCE_REMOVE;
-    });
-}
-
-export function afterOverviewHidden(callback, registry) {
-    if (!Main.overview.visible) {
-        callback();
-        return;
-    }
-
-    Logger.log('Waiting for overview to hide...');
-
-    let done = false;
-    let timeoutId = null;
-
-    const hiddenId = Main.overview.connect('hidden', () => {
-        if (done) return;
-        done = true;
-        Main.overview.disconnect(hiddenId);
-        if (timeoutId !== null) registry.remove(timeoutId);
-        Logger.log('Overview hidden - executing callback');
-        callback();
-    });
-
-    timeoutId = registry.add(1000, () => {
-        if (!done) {
-            done = true;
-            Logger.log('Overview hide timeout - forcing callback');
-            try {
-                Main.overview.disconnect(hiddenId);
-            } catch (_e) {}
-            callback();
-        }
         return GLib.SOURCE_REMOVE;
     });
 }

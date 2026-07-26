@@ -12,6 +12,7 @@ import * as Logger from './logger.js';
 import * as constants from './constants.js';
 import {TileZone} from './constants.js';
 import * as WindowState from './windowState.js';
+import {ComputedLayouts, MosaicModel} from './mosaicModel.js';
 import {
     IS_MINIATURE,
     MINIATURE_SCALE,
@@ -52,26 +53,6 @@ export function* generateRowCompositions(n) {
     }
     for (let groups = 1; groups <= n; groups++) yield* build(n, groups, []);
 }
-
-// Keyed by window ID internally to survive GI reference churn; API mirrors WeakMap
-const _computedLayouts = new Map();
-export const ComputedLayouts = {
-    get(mw) {
-        const id = mw?.get_id?.();
-        return id !== undefined ? _computedLayouts.get(id) : undefined;
-    },
-    set(mw, layout) {
-        const id = mw?.get_id?.();
-        if (id !== undefined) _computedLayouts.set(id, layout);
-    },
-    delete(mw) {
-        const id = mw?.get_id?.();
-        if (id !== undefined) _computedLayouts.delete(id);
-    },
-    clear() {
-        _computedLayouts.clear();
-    },
-};
 
 // Mutter will not place a window outside the work area; it silently clamps. Land on the same
 // spot it would, or the layout believes the window is somewhere it never was.
@@ -191,7 +172,7 @@ export const TilingManager = GObject.registerClass(
             this._windowingManager = manager;
         }
 
-        // Effective size: pending async sizes → frame rect → saved sizes → fallback
+        // Effective size: pending async sizes → model slot → frame rect → saved sizes → fallback
         getEffectiveWindowSize(window) {
             const miniSize = getMiniatureSize(window);
             if (miniSize) return miniSize;
@@ -206,10 +187,8 @@ export const TilingManager = GObject.registerClass(
                 return {width: restoredSize.width, height: restoredSize.height};
             }
 
-            const frame = window.get_frame_rect();
-            if (frame.width > 0 && frame.height > 0) {
-                return {width: frame.width, height: frame.height};
-            }
+            const modelOrFrameSize = this._getSizeFromModelOrFrame(window);
+            if (modelOrFrameSize) return modelOrFrameSize;
 
             const preferred =
                 WindowState.get(window, 'preferredSize') || WindowState.get(window, 'openingSize');
@@ -221,6 +200,20 @@ export const TilingManager = GObject.registerClass(
                 width: constants.SMART_RESIZE_MIN_WINDOW_WIDTH,
                 height: constants.SMART_RESIZE_MIN_WINDOW_HEIGHT,
             };
+        }
+
+        // The model is authoritative while Overview is open because Mutter drops
+        // move/resize requests and leaves the real frame at its previous geometry.
+        _getSizeFromModelOrFrame(window) {
+            const slot = MosaicModel.slotFor(window);
+            if (slot?.width > 0 && slot?.height > 0)
+                return {width: slot.width, height: slot.height};
+
+            const frame = window.get_frame_rect();
+            if (frame.width > 0 && frame.height > 0)
+                return {width: frame.width, height: frame.height};
+
+            return null;
         }
 
         // Native minimum size via Mutter 50+ get_min_size(), with fallback.
@@ -539,13 +532,12 @@ export const TilingManager = GObject.registerClass(
                                 constants.ANIMATION_DURATION_MS
                             );
                         }
-                        // MosaicLayoutStrategy reads ComputedLayouts for the overview slot, so keep it in sync.
-                        ComputedLayouts.set(window, {
-                            x: pos.x,
-                            y: pos.y,
-                            width: pos.width,
-                            height: pos.height,
-                        });
+                        MosaicModel.setSlot(
+                            window,
+                            {x: pos.x, y: pos.y, width: pos.width, height: pos.height},
+                            workspace,
+                            monitor
+                        );
                         continue;
                     }
 
@@ -1847,6 +1839,8 @@ export const TilingManager = GObject.registerClass(
         }
 
         _drawTile(
+            workspace,
+            monitor,
             tile_info,
             work_area,
             meta_windows,
@@ -1864,6 +1858,8 @@ export const TilingManager = GObject.registerClass(
                         `Drawing horizontal level at y=${y}, width=${level.width}, height=${level.height}`
                     );
                     level.draw_horizontal(
+                        workspace,
+                        monitor,
                         meta_windows,
                         work_area,
                         y,
@@ -1883,6 +1879,8 @@ export const TilingManager = GObject.registerClass(
                         `Drawing vertical level at x=${x}, width=${level.width}, height=${level.height}`
                     );
                     level.draw_vertical(
+                        workspace,
+                        monitor,
                         meta_windows,
                         x,
                         this.masks,
@@ -1899,6 +1897,7 @@ export const TilingManager = GObject.registerClass(
 
         _animateTileLayout(
             workspace,
+            monitor,
             tile_info,
             work_area,
             meta_windows,
@@ -1966,7 +1965,7 @@ export const TilingManager = GObject.registerClass(
                                     width: windowDesc.width,
                                     height: windowDesc.height,
                                 };
-                                ComputedLayouts.set(window, miniSlot);
+                                MosaicModel.setSlot(window, miniSlot, workspace, monitor);
                                 if (slotsOut) slotsOut.set(window.get_id(), miniSlot);
                                 Logger.log(
                                     `[MINIATURE] animateTile H ${window.get_id()}: target=(${tx},${ty}) scale=${sc.toFixed(4)} extLeft=${extL} extTop=${extT} size=${windowDesc.width}x${windowDesc.height}`
@@ -1983,7 +1982,7 @@ export const TilingManager = GObject.registerClass(
                                     width: windowDesc.width,
                                     height: windowDesc.height,
                                 };
-                                ComputedLayouts.set(window, slot);
+                                MosaicModel.setSlot(window, slot, workspace, monitor);
                                 if (slotsOut) slotsOut.set(window.get_id(), slot);
                                 miniLayouts.push({window, rect: slot});
                                 Logger.log(
@@ -1998,7 +1997,7 @@ export const TilingManager = GObject.registerClass(
                                     width: windowDesc.width,
                                     height: windowDesc.height,
                                 };
-                                ComputedLayouts.set(window, slot);
+                                MosaicModel.setSlot(window, slot, workspace, monitor);
                                 if (slotsOut) slotsOut.set(window.get_id(), slot);
                                 miniLayouts.push({window, rect: slot});
                                 Logger.log(
@@ -2014,7 +2013,7 @@ export const TilingManager = GObject.registerClass(
                                     width: windowDesc.width,
                                     height: windowDesc.height,
                                 };
-                                ComputedLayouts.set(window, slot);
+                                MosaicModel.setSlot(window, slot, workspace, monitor);
                                 if (slotsOut) slotsOut.set(window.get_id(), slot);
                                 windowLayouts.push({window, rect: slot});
                             }
@@ -2061,7 +2060,7 @@ export const TilingManager = GObject.registerClass(
                                     width: windowDesc.width,
                                     height: windowDesc.height,
                                 };
-                                ComputedLayouts.set(window, miniSlot);
+                                MosaicModel.setSlot(window, miniSlot, workspace, monitor);
                                 if (slotsOut) slotsOut.set(window.get_id(), miniSlot);
                                 Logger.log(
                                     `[MINIATURE] animateTile V ${window.get_id()}: target=(${targetX},${targetY}) scale=${sc.toFixed(4)} extLeft=${extL} extTop=${extT} slotSize=${windowDesc.width}x${windowDesc.height}`
@@ -2078,7 +2077,7 @@ export const TilingManager = GObject.registerClass(
                                     width: windowDesc.width,
                                     height: windowDesc.height,
                                 };
-                                ComputedLayouts.set(window, slot);
+                                MosaicModel.setSlot(window, slot, workspace, monitor);
                                 if (slotsOut) slotsOut.set(window.get_id(), slot);
                                 miniLayouts.push({window, rect: slot});
                                 Logger.log(
@@ -2093,7 +2092,7 @@ export const TilingManager = GObject.registerClass(
                                     width: windowDesc.width,
                                     height: windowDesc.height,
                                 };
-                                ComputedLayouts.set(window, slot);
+                                MosaicModel.setSlot(window, slot, workspace, monitor);
                                 if (slotsOut) slotsOut.set(window.get_id(), slot);
                                 miniLayouts.push({window, rect: slot});
                                 Logger.log(
@@ -2109,7 +2108,7 @@ export const TilingManager = GObject.registerClass(
                                     width: windowDesc.width,
                                     height: windowDesc.height,
                                 };
-                                ComputedLayouts.set(window, slot);
+                                MosaicModel.setSlot(window, slot, workspace, monitor);
                                 if (slotsOut) slotsOut.set(window.get_id(), slot);
                                 windowLayouts.push({window, rect: slot});
                             }
@@ -2238,7 +2237,13 @@ export const TilingManager = GObject.registerClass(
                 allWindows[0];
             const others = allWindows.filter(w => w.get_id() !== reference.get_id());
 
-            const resizeResult = this.tryFitWithResize(reference, others, workArea, reference);
+            const resizeResult = this.tryFitWithResize(
+                reference,
+                others,
+                workArea,
+                workspace,
+                reference
+            );
 
             if (resizeResult?.success) {
                 this._isSmartResizingBlocked = true;
@@ -2684,7 +2689,8 @@ export const TilingManager = GObject.registerClass(
                             const resizeResult = this.tryFitWithResize(
                                 reference_meta_window,
                                 realExisting,
-                                workArea
+                                workArea,
+                                workspace
                             );
                             if (!resizeResult?.success) {
                                 Logger.log('Smart resize could not fit sacred window');
@@ -2729,6 +2735,8 @@ export const TilingManager = GObject.registerClass(
             if (overflow && canMiniaturize && this._extension?.miniatureManager) {
                 const focusedId = global.display.focus_window?.get_id();
                 const resizingId = this._animationsManager?.getResizingWindowId();
+                const mru = this._windowingManager.getMRUOrder(workspace);
+                const rank = window => mru.get(window.get_id()) ?? Number.MAX_SAFE_INTEGER;
 
                 const overflowCandidates = meta_windows
                     .filter(
@@ -2740,11 +2748,7 @@ export const TilingManager = GObject.registerClass(
                             w.get_id() !== (reference_meta_window?.get_id() ?? null) &&
                             !this._windowingManager.isMaximizedOrFullscreen(w)
                     )
-                    .sort(
-                        (a, b) =>
-                            (WindowState.get(a, 'addedTime') ?? 0) -
-                            (WindowState.get(b, 'addedTime') ?? 0)
-                    );
+                    .sort((a, b) => rank(b) - rank(a));
 
                 let overflowResolved = false;
 
@@ -2839,6 +2843,7 @@ export const TilingManager = GObject.registerClass(
 
                 animationsHandledPositioning = this._animateTileLayout(
                     workspace,
+                    monitor,
                     tile_info,
                     tileArea,
                     meta_windows,
@@ -2849,7 +2854,16 @@ export const TilingManager = GObject.registerClass(
 
             if (!animationsHandledPositioning) {
                 Logger.log('Animations did not handle positioning, calling drawTile');
-                this._drawTile(tile_info, tileArea, meta_windows, false, computedSlots, work_area);
+                this._drawTile(
+                    workspace,
+                    monitor,
+                    tile_info,
+                    tileArea,
+                    meta_windows,
+                    false,
+                    computedSlots,
+                    work_area
+                );
                 // _animateTileLayout owns the deferred unlock; since it didn't run,
                 // release the lock now that positioning is done synchronously.
                 this._unlockWorkspaceEarlyReturn(workspace);
@@ -2905,6 +2919,7 @@ export const TilingManager = GObject.registerClass(
                 layout: this._cachedTileResult?.windows || null,
                 computedSlots,
             };
+            this._extension?.mosaicRenderer?.publishToOverview(workspace, monitor);
             this.emit('mosaic-changed', workspace);
 
             if (!isRecursive) {
@@ -3515,33 +3530,7 @@ export const TilingManager = GObject.registerClass(
             return this._clampedWorkArea(workspace, monitor);
         }
 
-        calculateLayoutsOnly(targetWorkspace = null, targetMonitor = null) {
-            const workspace = targetWorkspace || global.workspace_manager.get_active_workspace();
-
-            // Handle monitor index or object
-            let monitorIndex = global.display.get_primary_monitor();
-            if (targetMonitor !== null && targetMonitor !== undefined) {
-                monitorIndex =
-                    typeof targetMonitor === 'number' ? targetMonitor : targetMonitor.index;
-            } else {
-                const focusMon = global.display.get_focus_window()?.get_monitor();
-                if (focusMon !== undefined && focusMon !== null) monitorIndex = focusMon;
-            }
-
-            // Pass excludeFromTiling=false to ensure we consider the new window
-            const working_info = this._getWorkingInfo(workspace, null, monitorIndex, false);
-            if (!working_info) return;
-
-            const meta_windows = working_info.meta_windows;
-            const windows = working_info.windows;
-            const work_area = working_info.work_area;
-
-            const tile_info = this._tile(windows, work_area);
-
-            this._drawTile(tile_info, work_area, meta_windows, true, null, work_area);
-        }
-
-        tryFitWithResize(newWindow, windows, workArea, focusedWindowOverride = null) {
+        tryFitWithResize(newWindow, windows, workArea, workspace, focusedWindowOverride = null) {
             if (this._isSmartResizingBlocked) {
                 Logger.log('[SMART RESIZE] tryFitWithResize BLOCKED by _isSmartResizingBlocked');
                 return {success: false};
@@ -3617,9 +3606,10 @@ export const TilingManager = GObject.registerClass(
                 Logger.log(
                     `[SMART RESIZE] tryFitWithResize: ${allWindows.length} windows (${allResizable.length} resizable), workArea: ${workArea.width}×${workArea.height}`
                 );
+                const mruForDiagnostics = this._windowingManager.getMRUOrder(workspace);
                 for (const [id, d] of windowData) {
                     Logger.log(
-                        `[SMART RESIZE]   ${id}(${d.window.get_wm_class()}): current=${d.current.width}×${d.current.height}, min=${d.min.width}×${d.min.height}, resizable=${d.isResizable}, addedTime=${WindowState.get(d.window, 'addedTime')}`
+                        `[SMART RESIZE]   ${id}(${d.window.get_wm_class()}): current=${d.current.width}×${d.current.height}, min=${d.min.width}×${d.min.height}, resizable=${d.isResizable}, mruRank=${mruForDiagnostics.get(id) ?? '∞'}`
                     );
                 }
 
@@ -3672,14 +3662,11 @@ export const TilingManager = GObject.registerClass(
                             focusedWindowOverride ?? global.display.focus_window
                         )?.get_id();
 
-                        // Oldest first: whichever window has been open longest is the
-                        // best candidate to sacrifice, regardless of which window's
-                        // pass happens to be running right now.
-                        const orderedWindows0 = [...allWindows].sort(
-                            (a, b) =>
-                                (WindowState.get(a, 'addedTime') ?? 0) -
-                                (WindowState.get(b, 'addedTime') ?? 0)
-                        );
+                        // Higher MRU indexes are less recent, so sacrifice the window
+                        // the user has ignored longest.
+                        const mru = this._windowingManager.getMRUOrder(workspace);
+                        const rank = window => mru.get(window.get_id()) ?? Number.MAX_SAFE_INTEGER;
+                        const orderedWindows0 = [...allWindows].sort((a, b) => rank(b) - rank(a));
 
                         for (const w of orderedWindows0) {
                             const d = windowData.get(w.get_id());
@@ -3764,6 +3751,9 @@ export const TilingManager = GObject.registerClass(
                         };
                     };
 
+                    const mru = this._windowingManager.getMRUOrder(workspace);
+                    const rank = id => mru.get(id) ?? Number.MAX_SAFE_INTEGER;
+
                     for (let iter = 0; iter < allWindows.length; iter++) {
                         const candidates = buildSimulated(lo).filter(sim => {
                             const d = windowData.get(sim.id);
@@ -3784,13 +3774,7 @@ export const TilingManager = GObject.registerClass(
 
                         if (candidates.length === 0) break;
 
-                        // Oldest first: the longest-open window is the best one to sacrifice,
-                        // regardless of which window's pass happens to be running right now.
-                        candidates.sort(
-                            (a, b) =>
-                                (WindowState.get(windowData.get(a.id).window, 'addedTime') ?? 0) -
-                                (WindowState.get(windowData.get(b.id).window, 'addedTime') ?? 0)
-                        );
+                        candidates.sort((a, b) => rank(b.id) - rank(a.id));
                         const candidateSim = candidates[0];
                         const candidateData = windowData.get(candidateSim.id);
 
@@ -4366,6 +4350,8 @@ class Level {
     }
 
     draw_horizontal(
+        workspace,
+        monitor,
         meta_windows,
         work_area,
         y,
@@ -4400,7 +4386,7 @@ class Level {
 
             if (window.metaWindow) {
                 const slot = {x: drawX, y: drawY, width: window.width, height: window.height};
-                ComputedLayouts.set(window.metaWindow, slot);
+                MosaicModel.setSlot(window.metaWindow, slot, workspace, monitor);
                 if (slotsOut) slotsOut.set(window.metaWindow.get_id(), slot);
             }
 
@@ -4410,6 +4396,8 @@ class Level {
     }
 
     draw_vertical(
+        workspace,
+        monitor,
         meta_windows,
         x,
         masks,
@@ -4439,7 +4427,7 @@ class Level {
 
             if (window.metaWindow) {
                 const slot = {x: drawX, y: drawY, width: window.width, height: window.height};
-                ComputedLayouts.set(window.metaWindow, slot);
+                MosaicModel.setSlot(window.metaWindow, slot, workspace, monitor);
                 if (slotsOut) slotsOut.set(window.metaWindow.get_id(), slot);
             }
 

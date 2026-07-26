@@ -147,11 +147,9 @@ export const AnimationsManager = GObject.registerClass(
             } = options;
 
             if (!this.shouldAnimateWindow(window, draggedWindow)) {
-                // Overview visible means not yet, not never: this window gets retiled
-                // again once it hides (onOverviewHidden's re-enqueue) and deserves a real
-                // shot at animating then. move_resize_frame is a no-op while the overview's
-                // open anyway (Mutter discards it), so skip entirely rather than snapping
-                // to a position that never took effect and losing the animation.
+                // Mutter drops real frame moves while Overview is open. The tile pass
+                // still records and publishes the model slot, and hide-time flushing
+                // applies it, so avoid a geometry request that cannot take effect here.
                 if (Main.overview.visible) {
                     if (onComplete) onComplete();
                     return;
