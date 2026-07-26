@@ -170,7 +170,10 @@ export default class ContinuumExtension extends Extension {
         this.tilingManager = new TilingManager();
         this.tilingManager.setExtension(this);
         this.reorderingManager = new ReorderingManager();
-        this.swappingManager = new SwappingManager();
+        this.swappingManager = new SwappingManager({
+            tilingManager: this.tilingManager,
+            edgeTilingManager: this.edgeTilingManager,
+        });
         this.drawingManager = new DrawingManager();
         this.animationsManager = new AnimationsManager();
         this.mosaicRenderer = new MosaicRenderer();
@@ -193,9 +196,6 @@ export default class ContinuumExtension extends Extension {
         this.reorderingManager.setEdgeTilingManager(this.edgeTilingManager);
         this.reorderingManager.setAnimationsManager(this.animationsManager);
         this.reorderingManager.setWindowingManager(this.windowingManager);
-
-        this.swappingManager.setTilingManager(this.tilingManager);
-        this.swappingManager.setEdgeTilingManager(this.edgeTilingManager);
 
         this.drawingManager.setEdgeTilingManager(this.edgeTilingManager);
 

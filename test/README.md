@@ -46,10 +46,14 @@ The scenarios cover:
 - teardown cleanup and re-enable;
 - multi-monitor distribution, close rebalance, and maximized placement;
 - relative order preservation and idle layout stability.
+- direct mosaic swapping below the headless compositor's unsupported global-shortcut layer;
+- real GTK client minimum-size constraints under overflow pressure;
+- pointer-driven move and resize grab lifecycles.
 
 Headless tests exercise real Mutter and Shell state transitions, but they do not
-replace final checks in a logged-in Wayland session for pointer-driven dragging,
-monitor hotplug, client-enforced minimum sizes, and animation appearance.
+replace final checks in a logged-in Wayland session for global shortcut dispatch,
+monitor hotplug, clients that enforce constraints beyond their advertised minimum,
+and animation appearance.
 
 GNOME Shell 50's headless virtual keyboard does not dispatch global shortcuts
 (including GNOME's own Super+Up binding). The full tiling/swapping shortcut

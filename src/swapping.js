@@ -8,584 +8,538 @@ import * as Logger from './logger.js';
 import {TileZone} from './constants.js';
 import * as WindowState from './windowState.js';
 import {monotonicNow} from './timing.js';
-import GObject from 'gi://GObject';
 
-export const SwappingManager = GObject.registerClass(
-    {
-        GTypeName: 'ContinuumSwappingManager',
-    },
-    class SwappingManager extends GObject.Object {
-        _init() {
-            super._init();
-            this._tilingManager = null;
-            this._edgeTilingManager = null;
-        }
+export class SwappingManager {
+    constructor({tilingManager, edgeTilingManager}) {
+        this._tilingManager = tilingManager;
+        this._edgeTilingManager = edgeTilingManager;
+    }
 
-        setTilingManager(manager) {
-            this._tilingManager = manager;
-        }
+    findNeighbor(window, direction, workspace, monitor) {
+        if (!this._edgeTilingManager) return null;
 
-        setEdgeTilingManager(manager) {
-            this._edgeTilingManager = manager;
-        }
+        const windowState = this._edgeTilingManager.getWindowState(window);
+        const isWindowTiled = windowState && windowState.zone !== TileZone.NONE;
 
-        findNeighbor(window, direction, workspace, monitor) {
-            if (!this._edgeTilingManager) return null;
+        Logger.log(`Finding neighbor for window ${window.get_id()} in direction: ${direction}`);
 
-            const windowState = this._edgeTilingManager.getWindowState(window);
-            const isWindowTiled = windowState && windowState.zone !== TileZone.NONE;
-
-            Logger.log(`Finding neighbor for window ${window.get_id()} in direction: ${direction}`);
-
-            if (isWindowTiled) {
-                return this._findNeighborFromTiling(
-                    window,
-                    windowState.zone,
-                    direction,
-                    workspace,
-                    monitor
-                );
-            } else {
-                return this._findNeighborFromMosaic(window, direction, workspace, monitor);
-            }
-        }
-
-        _findNeighborFromTiling(window, zone, direction, workspace, monitor) {
-            const isQuarter = this._edgeTilingManager.isQuarterZone(zone);
-
-            if (direction === 'up' || direction === 'down') {
-                if (!isQuarter) {
-                    Logger.log('Vertical swap only works for quarter tiles');
-                    return null;
-                }
-                return this._findVerticalQuarterNeighbor(zone, direction, workspace, monitor);
-            }
-            return this._findHorizontalNeighborFromTiling(
+        if (isWindowTiled) {
+            return this._findNeighborFromTiling(
                 window,
-                zone,
+                windowState.zone,
                 direction,
                 workspace,
                 monitor
             );
+        } else {
+            return this._findNeighborFromMosaic(window, direction, workspace, monitor);
         }
+    }
 
-        _findVerticalQuarterNeighbor(zone, _direction, workspace, monitor) {
-            const edgeTiledWindows = this._edgeTilingManager.getEdgeTiledWindows(
-                workspace,
-                monitor
-            );
+    _findNeighborFromTiling(window, zone, direction, workspace, monitor) {
+        const isQuarter = this._edgeTilingManager.isQuarterZone(zone);
 
-            const verticalPairs = {
-                [TileZone.TOP_LEFT]: TileZone.BOTTOM_LEFT,
-                [TileZone.BOTTOM_LEFT]: TileZone.TOP_LEFT,
-                [TileZone.TOP_RIGHT]: TileZone.BOTTOM_RIGHT,
-                [TileZone.BOTTOM_RIGHT]: TileZone.TOP_RIGHT,
-            };
-
-            const targetZone = verticalPairs[zone];
-            if (!targetZone) return null;
-
-            const targetWindow = edgeTiledWindows.find(w => {
-                const state = this._edgeTilingManager.getWindowState(w.window);
-                return state && state.zone === targetZone;
-            });
-
-            if (targetWindow) {
-                return {window: targetWindow.window, zone: targetZone, type: 'tiling'};
+        if (direction === 'up' || direction === 'down') {
+            if (!isQuarter) {
+                Logger.log('Vertical swap only works for quarter tiles');
+                return null;
             }
+            return this._findVerticalQuarterNeighbor(zone, direction, workspace, monitor);
+        }
+        return this._findHorizontalNeighborFromTiling(window, zone, direction, workspace, monitor);
+    }
 
-            return {window: null, zone: targetZone, type: 'empty_tiling'};
+    _findVerticalQuarterNeighbor(zone, _direction, workspace, monitor) {
+        const edgeTiledWindows = this._edgeTilingManager.getEdgeTiledWindows(workspace, monitor);
+
+        const verticalPairs = {
+            [TileZone.TOP_LEFT]: TileZone.BOTTOM_LEFT,
+            [TileZone.BOTTOM_LEFT]: TileZone.TOP_LEFT,
+            [TileZone.TOP_RIGHT]: TileZone.BOTTOM_RIGHT,
+            [TileZone.BOTTOM_RIGHT]: TileZone.TOP_RIGHT,
+        };
+
+        const targetZone = verticalPairs[zone];
+        if (!targetZone) return null;
+
+        const targetWindow = edgeTiledWindows.find(w => {
+            const state = this._edgeTilingManager.getWindowState(w.window);
+            return state && state.zone === targetZone;
+        });
+
+        if (targetWindow) {
+            return {window: targetWindow.window, zone: targetZone, type: 'tiling'};
         }
 
-        _findHorizontalNeighborFromTiling(window, zone, direction, workspace, monitor) {
-            const isLeft =
-                zone === TileZone.LEFT_FULL ||
-                zone === TileZone.TOP_LEFT ||
-                zone === TileZone.BOTTOM_LEFT;
-            const isRight =
-                zone === TileZone.RIGHT_FULL ||
-                zone === TileZone.TOP_RIGHT ||
-                zone === TileZone.BOTTOM_RIGHT;
+        return {window: null, zone: targetZone, type: 'empty_tiling'};
+    }
 
-            let targetSide;
-            if (direction === 'left') targetSide = 'left';
-            else if (direction === 'right') targetSide = 'right';
-            else return null;
+    _findHorizontalNeighborFromTiling(window, zone, direction, workspace, monitor) {
+        const isLeft =
+            zone === TileZone.LEFT_FULL ||
+            zone === TileZone.TOP_LEFT ||
+            zone === TileZone.BOTTOM_LEFT;
+        const isRight =
+            zone === TileZone.RIGHT_FULL ||
+            zone === TileZone.TOP_RIGHT ||
+            zone === TileZone.BOTTOM_RIGHT;
 
-            const movingToOppositeSide =
-                (isLeft && targetSide === 'right') || (isRight && targetSide === 'left');
+        let targetSide;
+        if (direction === 'left') targetSide = 'left';
+        else if (direction === 'right') targetSide = 'right';
+        else return null;
 
-            if (movingToOppositeSide) {
-                return this._findOppositeSideNeighbor(window, zone, targetSide, workspace, monitor);
+        const movingToOppositeSide =
+            (isLeft && targetSide === 'right') || (isRight && targetSide === 'left');
+
+        if (movingToOppositeSide) {
+            return this._findOppositeSideNeighbor(window, zone, targetSide, workspace, monitor);
+        } else {
+            return this._findSameSideMosaicNeighbor(window, null, null, null, null);
+        }
+    }
+
+    _findOppositeSideNeighbor(_window, sourceZone, targetSide, workspace, monitor) {
+        const edgeTiledWindows = this._edgeTilingManager.getEdgeTiledWindows(workspace, monitor);
+        const isQuarter = this._edgeTilingManager.isQuarterZone(sourceZone);
+
+        const isTop = sourceZone === TileZone.TOP_LEFT || sourceZone === TileZone.TOP_RIGHT;
+        const isBottom =
+            sourceZone === TileZone.BOTTOM_LEFT || sourceZone === TileZone.BOTTOM_RIGHT;
+
+        const targetSideWindows = edgeTiledWindows.filter(w => {
+            const state = this._edgeTilingManager.getWindowState(w.window);
+            if (!state) return false;
+            const z = state.zone;
+            if (targetSide === 'left') {
+                return (
+                    z === TileZone.LEFT_FULL ||
+                    z === TileZone.TOP_LEFT ||
+                    z === TileZone.BOTTOM_LEFT
+                );
             } else {
-                return this._findSameSideMosaicNeighbor(window, null, null, null, null);
+                return (
+                    z === TileZone.RIGHT_FULL ||
+                    z === TileZone.TOP_RIGHT ||
+                    z === TileZone.BOTTOM_RIGHT
+                );
             }
-        }
+        });
 
-        _findOppositeSideNeighbor(_window, sourceZone, targetSide, workspace, monitor) {
-            const edgeTiledWindows = this._edgeTilingManager.getEdgeTiledWindows(
-                workspace,
-                monitor
-            );
-            const isQuarter = this._edgeTilingManager.isQuarterZone(sourceZone);
-
-            const isTop = sourceZone === TileZone.TOP_LEFT || sourceZone === TileZone.TOP_RIGHT;
-            const isBottom =
-                sourceZone === TileZone.BOTTOM_LEFT || sourceZone === TileZone.BOTTOM_RIGHT;
-
-            const targetSideWindows = edgeTiledWindows.filter(w => {
-                const state = this._edgeTilingManager.getWindowState(w.window);
-                if (!state) return false;
-                const z = state.zone;
-                if (targetSide === 'left') {
-                    return (
-                        z === TileZone.LEFT_FULL ||
-                        z === TileZone.TOP_LEFT ||
-                        z === TileZone.BOTTOM_LEFT
-                    );
-                } else {
-                    return (
-                        z === TileZone.RIGHT_FULL ||
-                        z === TileZone.TOP_RIGHT ||
-                        z === TileZone.BOTTOM_RIGHT
-                    );
-                }
-            });
-
-            if (targetSideWindows.length === 0) {
-                const mosaicNeighbor = this._findMosaicOnSide(targetSide, workspace, monitor);
-                if (mosaicNeighbor) return mosaicNeighbor;
-
-                if (isQuarter) {
-                    const targetZone =
-                        targetSide === 'left' ? TileZone.LEFT_FULL : TileZone.RIGHT_FULL;
-                    return {window: null, zone: targetZone, type: 'empty_tiling_expand'};
-                } else {
-                    return null;
-                }
-            }
-
-            if (isQuarter) {
-                const matchingLevel = targetSideWindows.find(w => {
-                    const state = this._edgeTilingManager.getWindowState(w.window);
-                    if (isTop) {
-                        return (
-                            state.zone ===
-                            (targetSide === 'left' ? TileZone.TOP_LEFT : TileZone.TOP_RIGHT)
-                        );
-                    } else if (isBottom) {
-                        return (
-                            state.zone ===
-                            (targetSide === 'left' ? TileZone.BOTTOM_LEFT : TileZone.BOTTOM_RIGHT)
-                        );
-                    }
-                    return false;
-                });
-
-                if (matchingLevel) {
-                    const state = this._edgeTilingManager.getWindowState(matchingLevel.window);
-                    return {window: matchingLevel.window, zone: state.zone, type: 'tiling'};
-                }
-
-                const targetWindow = targetSideWindows[0];
-                const state = this._edgeTilingManager.getWindowState(targetWindow.window);
-                return {window: targetWindow.window, zone: state.zone, type: 'tiling'};
-            } else {
-                const targetWindow = targetSideWindows[0];
-                const state = this._edgeTilingManager.getWindowState(targetWindow.window);
-                return {window: targetWindow.window, zone: state.zone, type: 'tiling'};
-            }
-        }
-
-        _findMosaicOnSide(side, workspace, monitor) {
-            if (!this._edgeTilingManager) return null;
-
-            const mosaicWindows = this._edgeTilingManager.getNonEdgeTiledWindows(
-                workspace,
-                monitor
-            );
-            if (mosaicWindows.length === 0) return null;
-
-            const workArea = workspace.get_work_area_for_monitor(monitor);
-            const centerX = workArea.x + workArea.width / 2;
-
-            const sideWindows = mosaicWindows.filter(w => {
-                const frame = w.get_frame_rect();
-                const windowCenterX = frame.x + frame.width / 2;
-                if (side === 'left') return windowCenterX < centerX;
-                else return windowCenterX >= centerX;
-            });
-
-            if (sideWindows.length > 0) {
-                return {window: sideWindows[0], zone: null, type: 'mosaic'};
-            }
-            return null;
-        }
-
-        _findSameSideMosaicNeighbor(_window, _zone, _direction, _workspace, _monitor) {
-            return null;
-        }
-
-        _findNeighborFromMosaic(window, direction, workspace, monitor) {
-            if (!this._edgeTilingManager) return null;
-
-            const mosaicWindows = this._edgeTilingManager.getNonEdgeTiledWindows(
-                workspace,
-                monitor
-            );
-            const windowFrame = window.get_frame_rect();
-
-            const mosaicNeighbor = this._findClosestMosaicInDirection(
-                window,
-                mosaicWindows,
-                direction
-            );
+        if (targetSideWindows.length === 0) {
+            const mosaicNeighbor = this._findMosaicOnSide(targetSide, workspace, monitor);
             if (mosaicNeighbor) return mosaicNeighbor;
 
-            if (direction === 'left' || direction === 'right') {
-                const edgeTiledWindows = this._edgeTilingManager.getEdgeTiledWindows(
-                    workspace,
-                    monitor
-                );
-                const workArea = workspace.get_work_area_for_monitor(monitor);
-                const centerX = workArea.x + workArea.width / 2;
-                const windowCenterX = windowFrame.x + windowFrame.width / 2;
-
-                if (direction === 'left' && windowCenterX > centerX) {
-                    const leftTiles = edgeTiledWindows.filter(w => {
-                        const state = this._edgeTilingManager.getWindowState(w.window);
-                        return (
-                            state &&
-                            (state.zone === TileZone.LEFT_FULL ||
-                                state.zone === TileZone.TOP_LEFT ||
-                                state.zone === TileZone.BOTTOM_LEFT)
-                        );
-                    });
-                    if (leftTiles.length > 0) {
-                        const state = this._edgeTilingManager.getWindowState(leftTiles[0].window);
-                        return {window: leftTiles[0].window, zone: state.zone, type: 'tiling'};
-                    }
-                } else if (direction === 'right' && windowCenterX < centerX) {
-                    const rightTiles = edgeTiledWindows.filter(w => {
-                        const state = this._edgeTilingManager.getWindowState(w.window);
-                        return (
-                            state &&
-                            (state.zone === TileZone.RIGHT_FULL ||
-                                state.zone === TileZone.TOP_RIGHT ||
-                                state.zone === TileZone.BOTTOM_RIGHT)
-                        );
-                    });
-                    if (rightTiles.length > 0) {
-                        const state = this._edgeTilingManager.getWindowState(rightTiles[0].window);
-                        return {window: rightTiles[0].window, zone: state.zone, type: 'tiling'};
-                    }
-                }
+            if (isQuarter) {
+                const targetZone = targetSide === 'left' ? TileZone.LEFT_FULL : TileZone.RIGHT_FULL;
+                return {window: null, zone: targetZone, type: 'empty_tiling_expand'};
+            } else {
+                return null;
             }
-            return null;
         }
 
-        _findClosestMosaicInDirection(window, mosaicWindows, direction) {
-            const windowFrame = window.get_frame_rect();
-            const windowCenterX = windowFrame.x + windowFrame.width / 2;
-            const windowCenterY = windowFrame.y + windowFrame.height / 2;
-
-            const candidates = mosaicWindows.filter(w => {
-                if (w.get_id() === window.get_id()) return false;
-
-                const frame = w.get_frame_rect();
-                const centerX = frame.x + frame.width / 2;
-                const centerY = frame.y + frame.height / 2;
-
-                if (direction === 'left' || direction === 'right') {
-                    const verticalOverlap = !(
-                        windowFrame.y + windowFrame.height <= frame.y ||
-                        frame.y + frame.height <= windowFrame.y
+        if (isQuarter) {
+            const matchingLevel = targetSideWindows.find(w => {
+                const state = this._edgeTilingManager.getWindowState(w.window);
+                if (isTop) {
+                    return (
+                        state.zone ===
+                        (targetSide === 'left' ? TileZone.TOP_LEFT : TileZone.TOP_RIGHT)
                     );
-                    if (!verticalOverlap) return false;
-                }
-                if (direction === 'up' || direction === 'down') {
-                    const horizontalOverlap = !(
-                        windowFrame.x + windowFrame.width <= frame.x ||
-                        frame.x + frame.width <= windowFrame.x
+                } else if (isBottom) {
+                    return (
+                        state.zone ===
+                        (targetSide === 'left' ? TileZone.BOTTOM_LEFT : TileZone.BOTTOM_RIGHT)
                     );
-                    if (!horizontalOverlap) return false;
                 }
-
-                switch (direction) {
-                    case 'left':
-                        return centerX < windowCenterX;
-                    case 'right':
-                        return centerX > windowCenterX;
-                    case 'up':
-                        return centerY < windowCenterY;
-                    case 'down':
-                        return centerY > windowCenterY;
-                    default:
-                        return false;
-                }
+                return false;
             });
 
-            if (candidates.length === 0) return null;
-
-            let closest = candidates[0];
-            let minDistance = Infinity;
-
-            for (const candidate of candidates) {
-                const frame = candidate.get_frame_rect();
-                const centerX = frame.x + frame.width / 2;
-                const centerY = frame.y + frame.height / 2;
-                let distance = Infinity;
-
-                switch (direction) {
-                    case 'left':
-                        distance = windowCenterX - centerX;
-                        break;
-                    case 'right':
-                        distance = centerX - windowCenterX;
-                        break;
-                    case 'up':
-                        distance = windowCenterY - centerY;
-                        break;
-                    case 'down':
-                        distance = centerY - windowCenterY;
-                        break;
-                }
-
-                if (distance < minDistance) {
-                    minDistance = distance;
-                    closest = candidate;
-                }
+            if (matchingLevel) {
+                const state = this._edgeTilingManager.getWindowState(matchingLevel.window);
+                return {window: matchingLevel.window, zone: state.zone, type: 'tiling'};
             }
 
-            return {window: closest, zone: null, type: 'mosaic'};
+            const targetWindow = targetSideWindows[0];
+            const state = this._edgeTilingManager.getWindowState(targetWindow.window);
+            return {window: targetWindow.window, zone: state.zone, type: 'tiling'};
+        } else {
+            const targetWindow = targetSideWindows[0];
+            const state = this._edgeTilingManager.getWindowState(targetWindow.window);
+            return {window: targetWindow.window, zone: state.zone, type: 'tiling'};
         }
+    }
 
-        swapWindow(window, direction) {
-            const workspace = window.get_workspace();
-            const monitor = window.get_monitor();
+    _findMosaicOnSide(side, workspace, monitor) {
+        if (!this._edgeTilingManager) return null;
 
-            Logger.log(`Swapping window ${window.get_id()} in direction: ${direction}`);
+        const mosaicWindows = this._edgeTilingManager.getNonEdgeTiledWindows(workspace, monitor);
+        if (mosaicWindows.length === 0) return null;
 
-            const windowState = this._edgeTilingManager.getWindowState(window);
-            const isWindowTiled = windowState && windowState.zone !== TileZone.NONE;
+        const workArea = workspace.get_work_area_for_monitor(monitor);
+        const centerX = workArea.x + workArea.width / 2;
 
-            const neighbor = this.findNeighbor(window, direction, workspace, monitor);
+        const sideWindows = mosaicWindows.filter(w => {
+            const frame = w.get_frame_rect();
+            const windowCenterX = frame.x + frame.width / 2;
+            if (side === 'left') return windowCenterX < centerX;
+            else return windowCenterX >= centerX;
+        });
 
-            // A snapped (edge-tiled) neighbor in this direction wins, so only recompose the
-            // mosaic when there isn't one. Recomposition is deterministic per press and moves
-            // retarget mid-flight, so it skips the anti-oscillation throttle below.
-            const snappedInDirection = neighbor && neighbor.type === 'tiling';
-            if (!isWindowTiled && this._tilingManager && !snappedInDirection) {
-                const best = this._tilingManager.bestRecomposition(
-                    workspace,
-                    monitor,
-                    window,
-                    direction
-                );
-                if (best) {
-                    this._tilingManager.pinComposition(workspace, best.shape, best.order);
-                    this._tilingManager.invalidateLayoutCache();
-                    this._tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
-                    Logger.log(
-                        `Recomposed to [${best.shape.join(',')}] moving ${window.get_id()} ${direction}`
+        if (sideWindows.length > 0) {
+            return {window: sideWindows[0], zone: null, type: 'mosaic'};
+        }
+        return null;
+    }
+
+    _findSameSideMosaicNeighbor(_window, _zone, _direction, _workspace, _monitor) {
+        return null;
+    }
+
+    _findNeighborFromMosaic(window, direction, workspace, monitor) {
+        if (!this._edgeTilingManager) return null;
+
+        const mosaicWindows = this._edgeTilingManager.getNonEdgeTiledWindows(workspace, monitor);
+        const windowFrame = window.get_frame_rect();
+
+        const mosaicNeighbor = this._findClosestMosaicInDirection(window, mosaicWindows, direction);
+        if (mosaicNeighbor) return mosaicNeighbor;
+
+        if (direction === 'left' || direction === 'right') {
+            const edgeTiledWindows = this._edgeTilingManager.getEdgeTiledWindows(
+                workspace,
+                monitor
+            );
+            const workArea = workspace.get_work_area_for_monitor(monitor);
+            const centerX = workArea.x + workArea.width / 2;
+            const windowCenterX = windowFrame.x + windowFrame.width / 2;
+
+            if (direction === 'left' && windowCenterX > centerX) {
+                const leftTiles = edgeTiledWindows.filter(w => {
+                    const state = this._edgeTilingManager.getWindowState(w.window);
+                    return (
+                        state &&
+                        (state.zone === TileZone.LEFT_FULL ||
+                            state.zone === TileZone.TOP_LEFT ||
+                            state.zone === TileZone.BOTTOM_LEFT)
                     );
-                    return true;
+                });
+                if (leftTiles.length > 0) {
+                    const state = this._edgeTilingManager.getWindowState(leftTiles[0].window);
+                    return {window: leftTiles[0].window, zone: state.zone, type: 'tiling'};
                 }
-                // Recompose is the whole mosaic keyboard action; if nothing moves that way, do
-                // nothing rather than an order-swap that would leave the pinned shape stale.
-                Logger.log(`No recomposition for ${window.get_id()} ${direction}`);
-                return false;
+            } else if (direction === 'right' && windowCenterX < centerX) {
+                const rightTiles = edgeTiledWindows.filter(w => {
+                    const state = this._edgeTilingManager.getWindowState(w.window);
+                    return (
+                        state &&
+                        (state.zone === TileZone.RIGHT_FULL ||
+                            state.zone === TileZone.TOP_RIGHT ||
+                            state.zone === TileZone.BOTTOM_RIGHT)
+                    );
+                });
+                if (rightTiles.length > 0) {
+                    const state = this._edgeTilingManager.getWindowState(rightTiles[0].window);
+                    return {window: rightTiles[0].window, zone: state.zone, type: 'tiling'};
+                }
+            }
+        }
+        return null;
+    }
+
+    _findClosestMosaicInDirection(window, mosaicWindows, direction) {
+        const windowFrame = window.get_frame_rect();
+        const windowCenterX = windowFrame.x + windowFrame.width / 2;
+        const windowCenterY = windowFrame.y + windowFrame.height / 2;
+
+        const candidates = mosaicWindows.filter(w => {
+            if (w.get_id() === window.get_id()) return false;
+
+            const frame = w.get_frame_rect();
+            const centerX = frame.x + frame.width / 2;
+            const centerY = frame.y + frame.height / 2;
+
+            if (direction === 'left' || direction === 'right') {
+                const verticalOverlap = !(
+                    windowFrame.y + windowFrame.height <= frame.y ||
+                    frame.y + frame.height <= windowFrame.y
+                );
+                if (!verticalOverlap) return false;
+            }
+            if (direction === 'up' || direction === 'down') {
+                const horizontalOverlap = !(
+                    windowFrame.x + windowFrame.width <= frame.x ||
+                    frame.x + frame.width <= windowFrame.x
+                );
+                if (!horizontalOverlap) return false;
             }
 
-            // Hysteresis: prevent rapid oscillation of the neighbor swap below.
-            const lastSwap = WindowState.get(window, 'lastSwapTime');
-            const now = monotonicNow();
-            if (lastSwap && now - lastSwap < 500) {
-                Logger.log(`Swap throttled for window ${window.get_id()}`);
-                return false;
-            }
-
-            if (!neighbor) {
-                Logger.log('No neighbor found in direction:', direction);
-                return false;
-            }
-
-            switch (neighbor.type) {
-                case 'mosaic':
-                    if (isWindowTiled) {
-                        return this._swapTiledWithMosaic(
-                            window,
-                            windowState.zone,
-                            neighbor.window,
-                            workspace,
-                            monitor
-                        );
-                    } else {
-                        return this._swapMosaicWindows(window, neighbor.window, workspace, monitor);
-                    }
-                case 'tiling':
-                    if (isWindowTiled) {
-                        return this._swapTiledWindows(
-                            window,
-                            windowState.zone,
-                            neighbor.window,
-                            neighbor.zone,
-                            workspace,
-                            monitor
-                        );
-                    } else {
-                        return this._swapMosaicWithTiled(
-                            window,
-                            neighbor.window,
-                            neighbor.zone,
-                            workspace,
-                            monitor
-                        );
-                    }
-                case 'empty_tiling':
-                    if (isWindowTiled) {
-                        return false;
-                    } else {
-                        const success = this._tileToEmptyZone(
-                            window,
-                            neighbor.zone,
-                            workspace,
-                            monitor
-                        );
-                        if (success) WindowState.set(window, 'lastSwapTime', monotonicNow());
-                        return success;
-                    }
-                case 'empty_tiling_expand':
-                    if (isWindowTiled && this._edgeTilingManager.isQuarterZone(windowState.zone)) {
-                        const success = this._expandQuarterToFull(
-                            window,
-                            windowState.zone,
-                            neighbor.zone,
-                            workspace,
-                            monitor
-                        );
-                        if (success) WindowState.set(window, 'lastSwapTime', monotonicNow());
-                        return success;
-                    }
-                    return false;
+            switch (direction) {
+                case 'left':
+                    return centerX < windowCenterX;
+                case 'right':
+                    return centerX > windowCenterX;
+                case 'up':
+                    return centerY < windowCenterY;
+                case 'down':
+                    return centerY > windowCenterY;
                 default:
                     return false;
             }
-        }
+        });
 
-        swapWindows(draggedWindow, targetWindow, targetZone, workspace, monitor) {
-            if (!this._edgeTilingManager) return false;
+        if (candidates.length === 0) return null;
 
-            Logger.log(`DnD Swap: ${draggedWindow.get_id()} → zone ${targetZone}`);
+        let closest = candidates[0];
+        let minDistance = Infinity;
 
-            if (draggedWindow.get_id() === targetWindow.get_id()) return false;
+        for (const candidate of candidates) {
+            const frame = candidate.get_frame_rect();
+            const centerX = frame.x + frame.width / 2;
+            const centerY = frame.y + frame.height / 2;
+            let distance = Infinity;
 
-            const draggedState = this._edgeTilingManager.getWindowState(draggedWindow);
-            const isDraggedTiled = draggedState && draggedState.zone !== TileZone.NONE;
+            switch (direction) {
+                case 'left':
+                    distance = windowCenterX - centerX;
+                    break;
+                case 'right':
+                    distance = centerX - windowCenterX;
+                    break;
+                case 'up':
+                    distance = windowCenterY - centerY;
+                    break;
+                case 'down':
+                    distance = centerY - windowCenterY;
+                    break;
+            }
 
-            if (isDraggedTiled) {
-                return this._swapTiledWindows(
-                    draggedWindow,
-                    draggedState.zone,
-                    targetWindow,
-                    targetZone,
-                    workspace,
-                    monitor
-                );
-            } else {
-                return this._swapMosaicWithTiled(
-                    draggedWindow,
-                    targetWindow,
-                    targetZone,
-                    workspace,
-                    monitor
-                );
+            if (distance < minDistance) {
+                minDistance = distance;
+                closest = candidate;
             }
         }
 
-        _swapMosaicWindows(window1, window2, workspace, monitor) {
-            if (!this._tilingManager) return false;
+        return {window: closest, zone: null, type: 'mosaic'};
+    }
 
-            Logger.log(`Swapping mosaic windows: ${window1.get_id()} ↔ ${window2.get_id()}`);
+    swapWindow(window, direction) {
+        const workspace = window.get_workspace();
+        const monitor = window.get_monitor();
 
-            const id1 = window1.get_id();
-            const id2 = window2.get_id();
+        Logger.log(`Swapping window ${window.get_id()} in direction: ${direction}`);
 
-            this._tilingManager.setTmpSwap(id1, id2);
-            this._tilingManager.applyTmpSwap(workspace);
-            this._tilingManager.clearTmpSwap();
-            this._tilingManager.invalidateLayoutCache();
-            this._tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
-            WindowState.set(window1, 'lastSwapTime', monotonicNow());
-            WindowState.set(window2, 'lastSwapTime', monotonicNow());
-            return true;
-        }
+        const windowState = this._edgeTilingManager.getWindowState(window);
+        const isWindowTiled = windowState && windowState.zone !== TileZone.NONE;
 
-        _swapMosaicWithTiled(mosaicWindow, tiledWindow, tiledZone, workspace, monitor) {
-            if (!this._edgeTilingManager) return false;
+        const neighbor = this.findNeighbor(window, direction, workspace, monitor);
 
-            Logger.log(
-                `Swapping mosaic ${mosaicWindow.get_id()} with tiled ${tiledWindow.get_id()}`
+        // A snapped (edge-tiled) neighbor in this direction wins, so only recompose the
+        // mosaic when there isn't one. Recomposition is deterministic per press and moves
+        // retarget mid-flight, so it skips the anti-oscillation throttle below.
+        const snappedInDirection = neighbor && neighbor.type === 'tiling';
+        if (!isWindowTiled && this._tilingManager && !snappedInDirection) {
+            const best = this._tilingManager.bestRecomposition(
+                workspace,
+                monitor,
+                window,
+                direction
             );
-
-            this._edgeTilingManager.removeTile(tiledWindow);
-
-            const workArea = workspace.get_work_area_for_monitor(monitor);
-            this._edgeTilingManager.applyTile(mosaicWindow, tiledZone, workArea, true);
-
-            WindowState.set(mosaicWindow, 'lastSwapTime', monotonicNow());
-            WindowState.set(tiledWindow, 'lastSwapTime', monotonicNow());
-            return true;
+            if (best) {
+                this._tilingManager.pinComposition(workspace, best.shape, best.order);
+                this._tilingManager.invalidateLayoutCache();
+                this._tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
+                Logger.log(
+                    `Recomposed to [${best.shape.join(',')}] moving ${window.get_id()} ${direction}`
+                );
+                return true;
+            }
+            // Recompose is the whole mosaic keyboard action; if nothing moves that way, do
+            // nothing rather than an order-swap that would leave the pinned shape stale.
+            Logger.log(`No recomposition for ${window.get_id()} ${direction}`);
+            return false;
         }
 
-        _swapTiledWithMosaic(tiledWindow, tiledZone, mosaicWindow, workspace, monitor) {
+        // Hysteresis: prevent rapid oscillation of the neighbor swap below.
+        const lastSwap = WindowState.get(window, 'lastSwapTime');
+        const now = monotonicNow();
+        if (lastSwap && now - lastSwap < 500) {
+            Logger.log(`Swap throttled for window ${window.get_id()}`);
+            return false;
+        }
+
+        if (!neighbor) {
+            Logger.log('No neighbor found in direction:', direction);
+            return false;
+        }
+
+        switch (neighbor.type) {
+            case 'mosaic':
+                if (isWindowTiled) {
+                    return this._swapTiledWithMosaic(
+                        window,
+                        windowState.zone,
+                        neighbor.window,
+                        workspace,
+                        monitor
+                    );
+                } else {
+                    return this._swapMosaicWindows(window, neighbor.window, workspace, monitor);
+                }
+            case 'tiling':
+                if (isWindowTiled) {
+                    return this._swapTiledWindows(
+                        window,
+                        windowState.zone,
+                        neighbor.window,
+                        neighbor.zone,
+                        workspace,
+                        monitor
+                    );
+                } else {
+                    return this._swapMosaicWithTiled(
+                        window,
+                        neighbor.window,
+                        neighbor.zone,
+                        workspace,
+                        monitor
+                    );
+                }
+            case 'empty_tiling':
+                if (isWindowTiled) {
+                    return false;
+                } else {
+                    const success = this._tileToEmptyZone(
+                        window,
+                        neighbor.zone,
+                        workspace,
+                        monitor
+                    );
+                    if (success) WindowState.set(window, 'lastSwapTime', monotonicNow());
+                    return success;
+                }
+            case 'empty_tiling_expand':
+                if (isWindowTiled && this._edgeTilingManager.isQuarterZone(windowState.zone)) {
+                    const success = this._expandQuarterToFull(
+                        window,
+                        windowState.zone,
+                        neighbor.zone,
+                        workspace,
+                        monitor
+                    );
+                    if (success) WindowState.set(window, 'lastSwapTime', monotonicNow());
+                    return success;
+                }
+                return false;
+            default:
+                return false;
+        }
+    }
+
+    swapWindows(draggedWindow, targetWindow, targetZone, workspace, monitor) {
+        if (!this._edgeTilingManager) return false;
+
+        Logger.log(`DnD Swap: ${draggedWindow.get_id()} → zone ${targetZone}`);
+
+        if (draggedWindow.get_id() === targetWindow.get_id()) return false;
+
+        const draggedState = this._edgeTilingManager.getWindowState(draggedWindow);
+        const isDraggedTiled = draggedState && draggedState.zone !== TileZone.NONE;
+
+        if (isDraggedTiled) {
+            return this._swapTiledWindows(
+                draggedWindow,
+                draggedState.zone,
+                targetWindow,
+                targetZone,
+                workspace,
+                monitor
+            );
+        } else {
             return this._swapMosaicWithTiled(
-                mosaicWindow,
-                tiledWindow,
-                tiledZone,
+                draggedWindow,
+                targetWindow,
+                targetZone,
                 workspace,
                 monitor
             );
         }
-
-        _swapTiledWindows(window1, zone1, window2, zone2, workspace, monitor) {
-            if (!this._edgeTilingManager) return false;
-
-            Logger.log(`Swapping tiled windows: ${window1.get_id()} ↔ ${window2.get_id()}`);
-
-            const workArea = workspace.get_work_area_for_monitor(monitor);
-            this._edgeTilingManager.applyTile(window1, zone2, workArea);
-            this._edgeTilingManager.applyTile(window2, zone1, workArea);
-
-            WindowState.set(window1, 'lastSwapTime', monotonicNow());
-            WindowState.set(window2, 'lastSwapTime', monotonicNow());
-
-            return true;
-        }
-
-        _tileToEmptyZone(window, zone, workspace, monitor) {
-            if (!this._edgeTilingManager) return false;
-
-            Logger.log(`Tiling window ${window.get_id()} to empty zone ${zone}`);
-            const workArea = workspace.get_work_area_for_monitor(monitor);
-            this._edgeTilingManager.applyTile(window, zone, workArea);
-            WindowState.set(window, 'lastSwapTime', monotonicNow());
-            return true;
-        }
-
-        _expandQuarterToFull(window, _currentZone, targetZone, workspace, monitor) {
-            if (!this._edgeTilingManager) return false;
-
-            Logger.log(`Expanding quarter tile ${window.get_id()} to ${targetZone}`);
-            const workArea = workspace.get_work_area_for_monitor(monitor);
-            this._edgeTilingManager.applyTile(window, targetZone, workArea);
-            WindowState.set(window, 'lastSwapTime', monotonicNow());
-            return true;
-        }
-
-        destroy() {
-            this._tilingManager = null;
-            this._edgeTilingManager = null;
-        }
     }
-);
+
+    _swapMosaicWindows(window1, window2, workspace, monitor) {
+        if (!this._tilingManager) return false;
+
+        Logger.log(`Swapping mosaic windows: ${window1.get_id()} ↔ ${window2.get_id()}`);
+
+        const id1 = window1.get_id();
+        const id2 = window2.get_id();
+
+        this._tilingManager.setTmpSwap(id1, id2);
+        this._tilingManager.applyTmpSwap(workspace);
+        this._tilingManager.clearTmpSwap();
+        this._tilingManager.invalidateLayoutCache();
+        this._tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
+        WindowState.set(window1, 'lastSwapTime', monotonicNow());
+        WindowState.set(window2, 'lastSwapTime', monotonicNow());
+        return true;
+    }
+
+    _swapMosaicWithTiled(mosaicWindow, tiledWindow, tiledZone, workspace, monitor) {
+        if (!this._edgeTilingManager) return false;
+
+        Logger.log(`Swapping mosaic ${mosaicWindow.get_id()} with tiled ${tiledWindow.get_id()}`);
+
+        this._edgeTilingManager.removeTile(tiledWindow);
+
+        const workArea = workspace.get_work_area_for_monitor(monitor);
+        this._edgeTilingManager.applyTile(mosaicWindow, tiledZone, workArea, true);
+
+        WindowState.set(mosaicWindow, 'lastSwapTime', monotonicNow());
+        WindowState.set(tiledWindow, 'lastSwapTime', monotonicNow());
+        return true;
+    }
+
+    _swapTiledWithMosaic(tiledWindow, tiledZone, mosaicWindow, workspace, monitor) {
+        return this._swapMosaicWithTiled(mosaicWindow, tiledWindow, tiledZone, workspace, monitor);
+    }
+
+    _swapTiledWindows(window1, zone1, window2, zone2, workspace, monitor) {
+        if (!this._edgeTilingManager) return false;
+
+        Logger.log(`Swapping tiled windows: ${window1.get_id()} ↔ ${window2.get_id()}`);
+
+        const workArea = workspace.get_work_area_for_monitor(monitor);
+        this._edgeTilingManager.applyTile(window1, zone2, workArea);
+        this._edgeTilingManager.applyTile(window2, zone1, workArea);
+
+        WindowState.set(window1, 'lastSwapTime', monotonicNow());
+        WindowState.set(window2, 'lastSwapTime', monotonicNow());
+
+        return true;
+    }
+
+    _tileToEmptyZone(window, zone, workspace, monitor) {
+        if (!this._edgeTilingManager) return false;
+
+        Logger.log(`Tiling window ${window.get_id()} to empty zone ${zone}`);
+        const workArea = workspace.get_work_area_for_monitor(monitor);
+        this._edgeTilingManager.applyTile(window, zone, workArea);
+        WindowState.set(window, 'lastSwapTime', monotonicNow());
+        return true;
+    }
+
+    _expandQuarterToFull(window, _currentZone, targetZone, workspace, monitor) {
+        if (!this._edgeTilingManager) return false;
+
+        Logger.log(`Expanding quarter tile ${window.get_id()} to ${targetZone}`);
+        const workArea = workspace.get_work_area_for_monitor(monitor);
+        this._edgeTilingManager.applyTile(window, targetZone, workArea);
+        WindowState.set(window, 'lastSwapTime', monotonicNow());
+        return true;
+    }
+
+    destroy() {
+        this._tilingManager = null;
+        this._edgeTilingManager = null;
+    }
+}

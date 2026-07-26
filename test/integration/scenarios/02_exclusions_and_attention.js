@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import {
+    Main,
     assert,
     assertNonOverlapping,
     createWindows,
     destroyWindows,
+    hideOverview,
     normalWindows,
     settle,
     waitUntil,
@@ -13,6 +15,9 @@ import {
 export const METRICS = {};
 
 export async function run() {
+    hideOverview();
+    await waitUntil(() => !Main.overview.visible, 'Overview to hide before focus checks');
+
     const windows = await createWindows([
         {width: 300, height: 220},
         {width: 340, height: 240},
@@ -26,12 +31,16 @@ export async function run() {
         'the first window to receive focus'
     );
 
-    second.unset_demands_attention();
+    let attentionSignals = 0;
+    const attentionId = global.display.connect('window-demands-attention', () => {
+        attentionSignals++;
+    });
+    global.display.emit('window-demands-attention', second);
     await waitUntil(
-        () => !second.demands_attention,
-        'the attention target to start without a stale attention flag'
+        () => attentionSignals === 1,
+        'the synthetic attention signal to reach display handlers'
     );
-    second.set_demands_attention();
+    global.display.disconnect(attentionId);
     await waitUntil(
         () => global.display.focus_window?.get_id() === second.get_id(),
         'an attention-seeking window to be focused'
