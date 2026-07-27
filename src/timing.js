@@ -61,17 +61,6 @@ export class TimeoutRegistry {
         return registryId;
     }
 
-    addSeconds(seconds, callback, name = 'unnamed') {
-        const registryId = this._nextId++;
-        const sourceId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, seconds, () => {
-            const again = callback() === GLib.SOURCE_CONTINUE;
-            if (!again) this._timeouts.delete(registryId);
-            return again;
-        });
-        this._timeouts.set(registryId, {sourceId, name});
-        return registryId;
-    }
-
     remove(registryId) {
         const entry = this._timeouts.get(registryId);
         if (entry) {

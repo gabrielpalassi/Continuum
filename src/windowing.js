@@ -16,9 +16,9 @@ import {
     RETILE_DELAY_MS,
     TileZone,
 } from './constants.js';
-import * as WindowState from './windowState.js';
-import {IS_MINIATURE} from './windowState.js';
-import {isWindowAlive, isWorkspaceAlive} from './liveness.js';
+import * as ShellState from './shellState.js';
+import {IS_MINIATURE} from './shellState.js';
+import {isWindowAlive, isWorkspaceAlive} from './shellState.js';
 
 const BLACKLISTED_WM_CLASSES = ['org.gnome.Screenshot', 'Gnome-screenshot'];
 
@@ -42,6 +42,7 @@ export class WindowingManager {
         // WeakMap<Workspace, Map<String, Window[]>>
         this._windowsCache = new WeakMap();
         this._monitorPlacementCallbacks = new WeakMap();
+        this._deferredMonitorPlacements = new Set();
     }
 
     getTimestamp() {
@@ -223,7 +224,7 @@ export class WindowingManager {
         // overflow logic with stale source-monitor membership; allowing that stale
         // decision to change workspaces splits one transaction across two monitors
         // and two workspaces.
-        if (WindowState.get(window, 'monitorPlacementTarget') !== undefined) {
+        if (ShellState.get(window, 'monitorPlacementTarget') !== undefined) {
             Logger.log(
                 `[PLACEMENT] Ignoring stale overflow request for window ${window.get_id()} during monitor placement`
             );
@@ -238,7 +239,7 @@ export class WindowingManager {
             this._onOverflowChange?.(true);
 
             // Flag window as overflow-moved to prevent tiling errors
-            WindowState.set(window, 'movedByOverflow', true);
+            ShellState.set(window, 'movedByOverflow', true);
 
             // Use current workspace as origin to prevent overflow target loops.
             const currentIndex = window.get_workspace().index();
@@ -363,8 +364,8 @@ export class WindowingManager {
                                             );
                                         }
                                     } finally {
-                                        WindowState.remove(window, 'movedByOverflow');
-                                        WindowState.remove(window, 'overflowOriginWorkspace');
+                                        ShellState.remove(window, 'movedByOverflow');
+                                        ShellState.remove(window, 'overflowOriginWorkspace');
 
                                         this._onOverflowChange?.(false);
                                         resolve(target_workspace);
@@ -377,16 +378,16 @@ export class WindowingManager {
                         } catch (e) {
                             Logger.error(`Error during moveOversizedWindow retiling: ${e}`);
 
-                            WindowState.remove(window, 'movedByOverflow');
-                            WindowState.remove(window, 'overflowOriginWorkspace');
+                            ShellState.remove(window, 'movedByOverflow');
+                            ShellState.remove(window, 'overflowOriginWorkspace');
 
                             this._onOverflowChange?.(false);
                             resolve(target_workspace);
                         }
                     }, this._timeoutRegistry);
                 } else {
-                    WindowState.remove(window, 'movedByOverflow');
-                    WindowState.remove(window, 'overflowOriginWorkspace');
+                    ShellState.remove(window, 'movedByOverflow');
+                    ShellState.remove(window, 'overflowOriginWorkspace');
 
                     this._onOverflowChange?.(false);
                     resolve(target_workspace);
@@ -540,7 +541,7 @@ export class WindowingManager {
         if (originIsEmpty) {
             const incumbentWorkspace = incumbent.get_workspace();
             const incumbentMonitor = incumbent.get_monitor();
-            WindowState.set(incumbent, 'userPlacementDisplaced', true);
+            ShellState.set(incumbent, 'userPlacementDisplaced', true);
 
             try {
                 if (incumbentWorkspace !== originWorkspace)
@@ -553,10 +554,10 @@ export class WindowingManager {
                         incumbentMonitor,
                         originMonitor
                     );
-                    if (!moveStarted) WindowState.remove(incumbent, 'userPlacementDisplaced');
+                    if (!moveStarted) ShellState.remove(incumbent, 'userPlacementDisplaced');
                 } else {
                     this._timeoutRegistry?.addIdle(() => {
-                        WindowState.remove(incumbent, 'userPlacementDisplaced');
+                        ShellState.remove(incumbent, 'userPlacementDisplaced');
                         this.invalidateWindowsCache();
                         return GLib.SOURCE_REMOVE;
                     }, 'windowing_clearUserPlacementDisplacement');
@@ -570,7 +571,7 @@ export class WindowingManager {
                 );
                 return true;
             } catch (e) {
-                WindowState.remove(incumbent, 'userPlacementDisplaced');
+                ShellState.remove(incumbent, 'userPlacementDisplaced');
                 Logger.warn(
                     `[USER-PLACEMENT] Could not move incumbent into the vacated origin: ${e.message}`
                 );
@@ -638,7 +639,40 @@ export class WindowingManager {
         return null;
     }
 
-    moveWindowToMonitor(window, workspace, sourceMonitor, targetMonitor, onSettled = null) {
+    // A normal arrival blocked by a sacred source monitor still gets the complete
+    // smart-resize/miniature policy on another monitor. This selects the emptiest
+    // non-sacred destination for that attempt; _ensureWindowFits performs the
+    // actual fit decision after Mutter commits the monitor move.
+    findMonitorForResizeAttempt(window, workspace, sourceMonitor) {
+        if (!window || !workspace || !this._tilingManager) return null;
+
+        const candidates = [];
+        for (let monitor = 0; monitor < global.display.get_n_monitors(); monitor++) {
+            if (monitor === sourceMonitor) continue;
+
+            const workArea = this._tilingManager.getUsableWorkArea(workspace, monitor);
+            if (!workArea || workArea.width <= 0 || workArea.height <= 0) continue;
+
+            const windows = this.getMonitorWorkspaceWindows(workspace, monitor).filter(
+                candidate => candidate.get_id() !== window.get_id() && !this.isExcluded(candidate)
+            );
+            if (windows.some(candidate => this.isMaximizedOrFullscreen(candidate))) continue;
+
+            candidates.push({monitor, windowCount: windows.length});
+        }
+
+        candidates.sort((a, b) => a.windowCount - b.windowCount || a.monitor - b.monitor);
+        return candidates[0]?.monitor ?? null;
+    }
+
+    moveWindowToMonitor(
+        window,
+        workspace,
+        sourceMonitor,
+        targetMonitor,
+        onSettled = null,
+        {deferDestinationTiling = false} = {}
+    ) {
         if (
             targetMonitor === null ||
             targetMonitor === undefined ||
@@ -646,9 +680,11 @@ export class WindowingManager {
         )
             return false;
 
-        const pendingTarget = WindowState.get(window, 'monitorPlacementTarget');
+        const pendingTarget = ShellState.get(window, 'monitorPlacementTarget');
         if (pendingTarget !== undefined) {
             if (pendingTarget === targetMonitor) {
+                if (deferDestinationTiling)
+                    ShellState.set(window, 'monitorPlacementDeferDestinationTiling', true);
                 Logger.log(
                     `[PLACEMENT] Window ${window.get_id()} is already moving to monitor ${targetMonitor}; joining existing request`
                 );
@@ -672,9 +708,9 @@ export class WindowingManager {
         // Usually window-created prepared this before Mutter's map effect began.
         // Keep this fallback for the opposite signal ordering, where window-added
         // resolves placement first.
-        if (WindowState.get(window, 'openedMaximized')) {
-            WindowState.set(window, 'monitorPlacementEntrancePending', true);
-            WindowState.remove(window, 'pendingFirstPlacement');
+        if (ShellState.get(window, 'openedMaximized')) {
+            ShellState.set(window, 'monitorPlacementEntrancePending', true);
+            ShellState.remove(window, 'pendingFirstPlacement');
             this._animationsManager?.cancelPendingEntrance(window);
             const actor = window.get_compositor_private();
             if (actor && !actor.is_destroyed()) {
@@ -685,7 +721,7 @@ export class WindowingManager {
                 actor.opacity = 0;
                 this._timeoutRegistry?.addIdle(() => {
                     if (
-                        WindowState.get(window, 'monitorPlacementTarget') !== undefined &&
+                        ShellState.get(window, 'monitorPlacementTarget') !== undefined &&
                         !actor.is_destroyed()
                     ) {
                         actor.remove_transition('opacity');
@@ -695,27 +731,55 @@ export class WindowingManager {
                 }, 'windowing_holdMonitorPlacementEntrance');
             }
         }
-        WindowState.set(window, 'monitorPlacementSource', sourceMonitor);
-        WindowState.set(window, 'monitorPlacementTarget', targetMonitor);
+        ShellState.set(window, 'monitorPlacementSource', sourceMonitor);
+        ShellState.set(window, 'monitorPlacementTarget', targetMonitor);
+        if (deferDestinationTiling)
+            ShellState.set(window, 'monitorPlacementDeferDestinationTiling', true);
         this._monitorPlacementCallbacks.set(window, onSettled ? [onSettled] : []);
         const sourceFrame = window.get_frame_rect();
         const expectedSize = this._tilingManager?.getPreferredSize(window) ?? sourceFrame;
-        try {
-            window.move_to_monitor(targetMonitor);
-        } catch (e) {
-            WindowState.remove(window, 'monitorPlacementSource');
-            WindowState.remove(window, 'monitorPlacementTarget');
-            if (WindowState.get(window, 'monitorPlacementEntrancePending')) {
-                WindowState.remove(window, 'monitorPlacementEntrancePending');
+        const failPlacement = e => {
+            this._deferredMonitorPlacements.delete(window);
+            ShellState.remove(window, 'monitorPlacementSource');
+            ShellState.remove(window, 'monitorPlacementTarget');
+            ShellState.remove(window, 'monitorPlacementDeferDestinationTiling');
+            if (ShellState.get(window, 'monitorPlacementEntrancePending')) {
+                ShellState.remove(window, 'monitorPlacementEntrancePending');
                 this._animationsManager?.animateMonitorPlacementEntrance(window);
             }
             Logger.warn(
                 `[PLACEMENT] Failed moving window ${window.get_id()} to monitor ${targetMonitor}: ${e.message}`
             );
             this._resolveMonitorPlacement(window, false);
+        };
+        const startMove = () => {
+            if (!isWindowAlive(window)) {
+                failPlacement(new Error('window was destroyed before the monitor move'));
+                return false;
+            }
+            try {
+                window.move_to_monitor(targetMonitor);
+            } catch (e) {
+                failPlacement(e);
+                return false;
+            }
+            this.invalidateWindowsCache();
+            return true;
+        };
+
+        // Moving a window synchronously while Overview is updating its monitor
+        // previews can destroy a WindowPreview clone in the middle of its paint.
+        // Start on idle so Shell finishes the current scene traversal first.
+        if (Main.overview.visible && this._timeoutRegistry) {
+            this._deferredMonitorPlacements.add(window);
+            this._timeoutRegistry.addIdle(() => {
+                this._deferredMonitorPlacements.delete(window);
+                startMove();
+                return GLib.SOURCE_REMOVE;
+            }, 'windowing_startOverviewMonitorPlacement');
+        } else if (!startMove()) {
             return false;
         }
-        this.invalidateWindowsCache();
 
         // Do not tile either monitor yet: move_to_monitor updates MetaWindow
         // asynchronously, so an immediate source pass can still include the window
@@ -725,24 +789,29 @@ export class WindowingManager {
         let lastStableFrame = null;
         let stableFrameProbes = 0;
         const settlePlacement = () => {
+            if (ShellState.get(window, 'monitorPlacementTarget') === undefined)
+                return GLib.SOURCE_REMOVE;
+
             let currentMonitor;
             try {
                 currentMonitor = window.get_monitor();
             } catch (_e) {
-                WindowState.remove(window, 'monitorPlacementSource');
-                WindowState.remove(window, 'monitorPlacementTarget');
-                WindowState.remove(window, 'monitorPlacementEntrancePending');
-                WindowState.remove(window, 'userPlacementDisplaced');
+                ShellState.remove(window, 'monitorPlacementSource');
+                ShellState.remove(window, 'monitorPlacementTarget');
+                ShellState.remove(window, 'monitorPlacementEntrancePending');
+                ShellState.remove(window, 'monitorPlacementDeferDestinationTiling');
+                ShellState.remove(window, 'userPlacementDisplaced');
                 this._resolveMonitorPlacement(window, false);
                 return GLib.SOURCE_REMOVE;
             }
 
             const actor = window.get_compositor_private();
             if (actor && actor.is_destroyed()) {
-                WindowState.remove(window, 'monitorPlacementSource');
-                WindowState.remove(window, 'monitorPlacementTarget');
-                WindowState.remove(window, 'monitorPlacementEntrancePending');
-                WindowState.remove(window, 'userPlacementDisplaced');
+                ShellState.remove(window, 'monitorPlacementSource');
+                ShellState.remove(window, 'monitorPlacementTarget');
+                ShellState.remove(window, 'monitorPlacementEntrancePending');
+                ShellState.remove(window, 'monitorPlacementDeferDestinationTiling');
+                ShellState.remove(window, 'userPlacementDisplaced');
                 this._resolveMonitorPlacement(window, false);
                 return GLib.SOURCE_REMOVE;
             }
@@ -752,7 +821,7 @@ export class WindowingManager {
             // which would let a later compositor commit overwrite our destination
             // tiling. Fullscreen entrances additionally wait until their actor maps.
             const needsStableEntrance =
-                WindowState.get(window, 'monitorPlacementEntrancePending') === true;
+                ShellState.get(window, 'monitorPlacementEntrancePending') === true;
             if (currentMonitor === targetMonitor && (!needsStableEntrance || actor?.mapped)) {
                 const frame = window.get_frame_rect();
                 const targetArea = workspace.get_work_area_for_monitor(targetMonitor);
@@ -792,14 +861,15 @@ export class WindowingManager {
             Logger.warn(
                 `[PLACEMENT] Timed out waiting for window ${window.get_id()} to reach monitor ${targetMonitor}`
             );
-            WindowState.remove(window, 'monitorPlacementSource');
-            WindowState.remove(window, 'monitorPlacementTarget');
-            WindowState.remove(window, 'userPlacementDisplaced');
+            ShellState.remove(window, 'monitorPlacementSource');
+            ShellState.remove(window, 'monitorPlacementTarget');
+            ShellState.remove(window, 'monitorPlacementDeferDestinationTiling');
+            ShellState.remove(window, 'userPlacementDisplaced');
             this.invalidateWindowsCache();
             if (this._tilingManager)
                 this._tilingManager.tileWorkspaceWindows(workspace, null, sourceMonitor, false);
-            if (WindowState.get(window, 'monitorPlacementEntrancePending')) {
-                WindowState.remove(window, 'monitorPlacementEntrancePending');
+            if (ShellState.get(window, 'monitorPlacementEntrancePending')) {
+                ShellState.remove(window, 'monitorPlacementEntrancePending');
                 this._animationsManager?.animateMonitorPlacementEntrance(window);
             }
             this._resolveMonitorPlacement(window, false);
@@ -832,28 +902,33 @@ export class WindowingManager {
     }
 
     finishMonitorPlacement(window, workspace, enteredMonitor = null) {
-        const targetMonitor = WindowState.get(window, 'monitorPlacementTarget');
+        const targetMonitor = ShellState.get(window, 'monitorPlacementTarget');
         if (targetMonitor === undefined) return false;
         if (enteredMonitor !== null && enteredMonitor !== targetMonitor) return false;
         if (!isWindowAlive(window) || window.get_monitor() !== targetMonitor) return false;
 
-        const sourceMonitor = WindowState.get(window, 'monitorPlacementSource');
-        WindowState.remove(window, 'monitorPlacementSource');
-        WindowState.remove(window, 'monitorPlacementTarget');
-        WindowState.remove(window, 'userPlacementDisplaced');
+        const sourceMonitor = ShellState.get(window, 'monitorPlacementSource');
+        const deferDestinationTiling =
+            ShellState.get(window, 'monitorPlacementDeferDestinationTiling') === true;
+        ShellState.remove(window, 'monitorPlacementSource');
+        ShellState.remove(window, 'monitorPlacementTarget');
+        ShellState.remove(window, 'monitorPlacementDeferDestinationTiling');
+        ShellState.remove(window, 'userPlacementDisplaced');
         this.invalidateWindowsCache();
 
         if (this._tilingManager) {
             if (sourceMonitor !== undefined && sourceMonitor !== targetMonitor)
                 this._tilingManager.tileWorkspaceWindows(workspace, null, sourceMonitor, false);
             // Sacred windows own the whole destination monitor and are deliberately
-            // excluded from Mosaic layouts, so there is nothing to compute there.
-            if (!this.isMaximizedOrFullscreen(window))
+            // excluded from Mosaic layouts, so there is nothing to compute there. A
+            // deferred destination is evaluated by WindowHandler with the normal
+            // smart-resize/miniature pipeline immediately after this transaction.
+            if (!this.isMaximizedOrFullscreen(window) && !deferDestinationTiling)
                 this._tilingManager.tileWorkspaceWindows(workspace, null, targetMonitor, false);
         }
 
-        if (WindowState.get(window, 'monitorPlacementEntrancePending')) {
-            WindowState.remove(window, 'monitorPlacementEntrancePending');
+        if (ShellState.get(window, 'monitorPlacementEntrancePending')) {
+            ShellState.remove(window, 'monitorPlacementEntrancePending');
             this._animationsManager?.animateMonitorPlacementEntrance(window);
         }
 
@@ -931,15 +1006,15 @@ export class WindowingManager {
                                 !movedWindowIds.has(w.get_id()) &&
                                 !this.isMaximizedOrFullscreen(w) &&
                                 !this._edgeTilingManager?.isEdgeTiled(w) &&
-                                !WindowState.get(w, IS_MINIATURE)
+                                !ShellState.get(w, IS_MINIATURE)
                         )
                         .sort((a, b) => {
                             const aFocused = a.get_id() === focusedId ? 1 : 0;
                             const bFocused = b.get_id() === focusedId ? 1 : 0;
                             return (
                                 aFocused - bFocused ||
-                                (WindowState.get(b, 'addedTime') ?? 0) -
-                                    (WindowState.get(a, 'addedTime') ?? 0) ||
+                                (ShellState.get(b, 'addedTime') ?? 0) -
+                                    (ShellState.get(a, 'addedTime') ?? 0) ||
                                 b.get_id() - a.get_id()
                             );
                         });
@@ -971,10 +1046,10 @@ export class WindowingManager {
                 // Batch the physical moves first. Tiling source+target for every
                 // individual move repeats the most expensive layout work and also
                 // lets monitor-enter signals start duplicate evaluation passes.
-                WindowState.set(selected.window, 'monitorRebalanceInProgress', true);
+                ShellState.set(selected.window, 'monitorRebalanceInProgress', true);
                 selected.window.move_to_monitor(selected.target.monitor);
             } catch (e) {
-                WindowState.remove(selected.window, 'monitorRebalanceInProgress');
+                ShellState.remove(selected.window, 'monitorRebalanceInProgress');
                 Logger.warn(
                     `[REBALANCE] Failed moving window ${selected.window.get_id()}: ${e.message}`
                 );
@@ -1008,7 +1083,7 @@ export class WindowingManager {
 
             const clearMoveFlags = () => {
                 for (const window of movedWindows)
-                    WindowState.remove(window, 'monitorRebalanceInProgress');
+                    ShellState.remove(window, 'monitorRebalanceInProgress');
                 return GLib.SOURCE_REMOVE;
             };
             if (this._timeoutRegistry)
@@ -1047,11 +1122,11 @@ export class WindowingManager {
                     new WorkspaceSwitcherPopup.WorkspaceSwitcherPopup();
             }
 
-            if (!WindowState.get(Main.wm._workspaceSwitcherPopup, 'destroyConnected')) {
+            if (!ShellState.get(Main.wm._workspaceSwitcherPopup, 'destroyConnected')) {
                 Main.wm._workspaceSwitcherPopup.connect('destroy', () => {
                     Main.wm._workspaceSwitcherPopup = null;
                 });
-                WindowState.set(Main.wm._workspaceSwitcherPopup, 'destroyConnected', true);
+                ShellState.set(Main.wm._workspaceSwitcherPopup, 'destroyConnected', true);
             }
 
             Main.wm._workspaceSwitcherPopup.display(index);
@@ -1060,6 +1135,17 @@ export class WindowingManager {
         }
     }
     destroy() {
+        for (const window of this._deferredMonitorPlacements) {
+            ShellState.remove(window, 'monitorPlacementSource');
+            ShellState.remove(window, 'monitorPlacementTarget');
+            ShellState.remove(window, 'monitorPlacementDeferDestinationTiling');
+            if (ShellState.get(window, 'monitorPlacementEntrancePending')) {
+                ShellState.remove(window, 'monitorPlacementEntrancePending');
+                const actor = isWindowAlive(window) ? window.get_compositor_private() : null;
+                if (actor && !actor.is_destroyed()) actor.opacity = 255;
+            }
+        }
+        this._deferredMonitorPlacements.clear();
         this._edgeTilingManager = null;
         this._animationsManager = null;
         this._tilingManager = null;

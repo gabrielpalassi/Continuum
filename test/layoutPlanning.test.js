@@ -4,12 +4,30 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
     enumerateTileSlots,
+    generateRowCompositions,
     orderWindowsByMru,
     planResizeFit,
     restoreBeforeRearrange,
 } from '../src/layoutPlanning.js';
 
 const windowWithId = id => ({get_id: () => id});
+
+test('row composition generation covers each ordered shape exactly once', () => {
+    assert.deepEqual([...generateRowCompositions(0)], []);
+    assert.deepEqual([...generateRowCompositions(1)], [[1]]);
+    assert.deepEqual([...generateRowCompositions(3)], [[3], [1, 2], [2, 1], [1, 1, 1]]);
+
+    for (let windowCount = 1; windowCount <= 8; windowCount++) {
+        const compositions = [...generateRowCompositions(windowCount)];
+        assert.equal(compositions.length, 2 ** (windowCount - 1));
+        assert.equal(new Set(compositions.map(shape => shape.join(','))).size, compositions.length);
+        assert.ok(
+            compositions.every(
+                shape => shape.reduce((sum, count) => sum + count, 0) === windowCount
+            )
+        );
+    }
+});
 
 test('restore-first orchestration skips the ordinary rearrangement after a restore', () => {
     let layouts = 0;
@@ -149,6 +167,37 @@ test('horizontal tile slots preserve shelf order, spacing, and vertical centerin
             rect: {x: 30, y: 108, width: 70, height: 50},
         },
     ]);
+});
+
+test('horizontal tile slots honor explicit target coordinates', () => {
+    const descriptor = {id: 1, width: 100, height: 40, targetX: 175, targetY: 95};
+    const tileInfo = {
+        vertical: false,
+        y: 20,
+        levels: [{x: 10, width: 100, height: 80, windows: [descriptor]}],
+    };
+
+    const [{rect}] = enumerateTileSlots(tileInfo, {x: 0, y: 0, width: 400, height: 240}, 8);
+
+    assert.deepEqual(rect, {x: 175, y: 95, width: 100, height: 40});
+});
+
+test('tile slots can be clamped to the bounds Mutter will enforce', () => {
+    const descriptor = {id: 1, width: 100, height: 60, targetX: -50, targetY: 190};
+    const tileInfo = {
+        vertical: true,
+        x: 20,
+        levels: [{y: 10, width: 100, height: 60, windows: [descriptor]}],
+    };
+
+    const [{rect}] = enumerateTileSlots(tileInfo, {x: 0, y: 0, width: 400, height: 240}, 8, {
+        x: 10,
+        y: 20,
+        width: 300,
+        height: 180,
+    });
+
+    assert.deepEqual(rect, {x: 10, y: 140, width: 100, height: 60});
 });
 
 test('vertical tile slots preserve shelf order and explicit target coordinates', () => {

@@ -5,7 +5,7 @@
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Logger from './logger.js';
 import GLib from 'gi://GLib';
-import {isWindowAlive} from './liveness.js';
+import {isWindowAlive} from './shellState.js';
 
 export class WindowAttentionManager {
     constructor(shellAttentionHandler, timeoutRegistry) {

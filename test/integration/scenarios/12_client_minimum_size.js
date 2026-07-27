@@ -43,12 +43,21 @@ export async function run() {
         );
         await settle(1200);
         const constrained = normalWindows().find(window => window.get_title() === TITLE);
-        const [hasHint, minWidth, minHeight] = constrained.get_min_size();
-        assert(hasHint, 'The GTK client should publish a minimum-size hint');
-        assert(
-            minWidth >= 600 && minHeight >= 400,
-            `The GTK constraint should reach Mutter, received ${minWidth}x${minHeight}`
-        );
+        let minWidth;
+        let minHeight;
+        // Shell exposes the Meta.Window before GTK's first surface commit applies
+        // the pending xdg_toplevel size hints, so wait for the observable constraint.
+        await waitUntil(() => {
+            const [hasHint, width, height] = constrained.get_min_size();
+            minWidth = width;
+            minHeight = height;
+            assert(hasHint, 'The GTK client should publish a minimum-size hint');
+            assert(
+                minWidth >= 600 && minHeight >= 400,
+                `The GTK constraint should reach Mutter, received ${minWidth}x${minHeight}`
+            );
+            return true;
+        }, 'the GTK minimum-size constraint to reach Mutter');
 
         for (let i = 0; i < 4; i++) {
             await Scripting.createTestWindow({width: 500, height: 360});

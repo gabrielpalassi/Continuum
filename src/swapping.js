@@ -6,7 +6,7 @@
 
 import * as Logger from './logger.js';
 import {TileZone} from './constants.js';
-import * as WindowState from './windowState.js';
+import * as ShellState from './shellState.js';
 import {monotonicNow} from './timing.js';
 
 export class SwappingManager {
@@ -361,7 +361,7 @@ export class SwappingManager {
         }
 
         // Hysteresis: prevent rapid oscillation of the neighbor swap below.
-        const lastSwap = WindowState.get(window, 'lastSwapTime');
+        const lastSwap = ShellState.get(window, 'lastSwapTime');
         const now = monotonicNow();
         if (lastSwap && now - lastSwap < 500) {
             Logger.log(`Swap throttled for window ${window.get_id()}`);
@@ -415,7 +415,7 @@ export class SwappingManager {
                         workspace,
                         monitor
                     );
-                    if (success) WindowState.set(window, 'lastSwapTime', monotonicNow());
+                    if (success) ShellState.set(window, 'lastSwapTime', monotonicNow());
                     return success;
                 }
             case 'empty_tiling_expand':
@@ -427,7 +427,7 @@ export class SwappingManager {
                         workspace,
                         monitor
                     );
-                    if (success) WindowState.set(window, 'lastSwapTime', monotonicNow());
+                    if (success) ShellState.set(window, 'lastSwapTime', monotonicNow());
                     return success;
                 }
                 return false;
@@ -479,8 +479,8 @@ export class SwappingManager {
         this._tilingManager.clearTmpSwap();
         this._tilingManager.invalidateLayoutCache();
         this._tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
-        WindowState.set(window1, 'lastSwapTime', monotonicNow());
-        WindowState.set(window2, 'lastSwapTime', monotonicNow());
+        ShellState.set(window1, 'lastSwapTime', monotonicNow());
+        ShellState.set(window2, 'lastSwapTime', monotonicNow());
         return true;
     }
 
@@ -494,8 +494,8 @@ export class SwappingManager {
         const workArea = workspace.get_work_area_for_monitor(monitor);
         this._edgeTilingManager.applyTile(mosaicWindow, tiledZone, workArea, true);
 
-        WindowState.set(mosaicWindow, 'lastSwapTime', monotonicNow());
-        WindowState.set(tiledWindow, 'lastSwapTime', monotonicNow());
+        ShellState.set(mosaicWindow, 'lastSwapTime', monotonicNow());
+        ShellState.set(tiledWindow, 'lastSwapTime', monotonicNow());
         return true;
     }
 
@@ -512,8 +512,8 @@ export class SwappingManager {
         this._edgeTilingManager.applyTile(window1, zone2, workArea);
         this._edgeTilingManager.applyTile(window2, zone1, workArea);
 
-        WindowState.set(window1, 'lastSwapTime', monotonicNow());
-        WindowState.set(window2, 'lastSwapTime', monotonicNow());
+        ShellState.set(window1, 'lastSwapTime', monotonicNow());
+        ShellState.set(window2, 'lastSwapTime', monotonicNow());
 
         return true;
     }
@@ -524,7 +524,7 @@ export class SwappingManager {
         Logger.log(`Tiling window ${window.get_id()} to empty zone ${zone}`);
         const workArea = workspace.get_work_area_for_monitor(monitor);
         this._edgeTilingManager.applyTile(window, zone, workArea);
-        WindowState.set(window, 'lastSwapTime', monotonicNow());
+        ShellState.set(window, 'lastSwapTime', monotonicNow());
         return true;
     }
 
@@ -534,7 +534,7 @@ export class SwappingManager {
         Logger.log(`Expanding quarter tile ${window.get_id()} to ${targetZone}`);
         const workArea = workspace.get_work_area_for_monitor(monitor);
         this._edgeTilingManager.applyTile(window, targetZone, workArea);
-        WindowState.set(window, 'lastSwapTime', monotonicNow());
+        ShellState.set(window, 'lastSwapTime', monotonicNow());
         return true;
     }
 

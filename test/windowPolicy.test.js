@@ -2,47 +2,47 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {isWindowAlive, isWorkspaceAlive} from '../src/liveness.js';
-import * as WindowState from '../src/windowState.js';
+import {isWindowAlive, isWorkspaceAlive} from '../src/shellState.js';
+import * as ShellState from '../src/shellState.js';
 
 test('window state supports the complete set/get/has/remove lifecycle', () => {
     const window = {};
 
-    assert.equal(WindowState.get(window, 'flag'), undefined);
-    assert.equal(WindowState.has(window, 'flag'), false);
+    assert.equal(ShellState.get(window, 'flag'), undefined);
+    assert.equal(ShellState.has(window, 'flag'), false);
 
-    WindowState.set(window, 'flag', false);
-    assert.equal(WindowState.get(window, 'flag'), false);
-    assert.equal(WindowState.has(window, 'flag'), true);
+    ShellState.set(window, 'flag', false);
+    assert.equal(ShellState.get(window, 'flag'), false);
+    assert.equal(ShellState.has(window, 'flag'), true);
 
-    WindowState.remove(window, 'flag');
-    assert.equal(WindowState.get(window, 'flag'), undefined);
-    assert.equal(WindowState.has(window, 'flag'), false);
+    ShellState.remove(window, 'flag');
+    assert.equal(ShellState.get(window, 'flag'), undefined);
+    assert.equal(ShellState.has(window, 'flag'), false);
 });
 
 test('window state remains isolated between windows', () => {
     const first = {};
     const second = {};
 
-    WindowState.set(first, WindowState.IS_MINIATURE, true);
-    WindowState.set(second, WindowState.IS_MINIATURE, false);
+    ShellState.set(first, ShellState.IS_MINIATURE, true);
+    ShellState.set(second, ShellState.IS_MINIATURE, false);
 
-    assert.equal(WindowState.get(first, WindowState.IS_MINIATURE), true);
-    assert.equal(WindowState.get(second, WindowState.IS_MINIATURE), false);
+    assert.equal(ShellState.get(first, ShellState.IS_MINIATURE), true);
+    assert.equal(ShellState.get(second, ShellState.IS_MINIATURE), false);
 });
 
 test('clearing a window removes all state without affecting another window', () => {
     const first = {};
     const second = {};
-    WindowState.set(first, 'one', 1);
-    WindowState.set(first, 'two', 2);
-    WindowState.set(second, 'one', 3);
+    ShellState.set(first, 'one', 1);
+    ShellState.set(first, 'two', 2);
+    ShellState.set(second, 'one', 3);
 
-    WindowState.clear(first);
+    ShellState.clear(first);
 
-    assert.equal(WindowState.get(first, 'one'), undefined);
-    assert.equal(WindowState.get(first, 'two'), undefined);
-    assert.equal(WindowState.get(second, 'one'), 3);
+    assert.equal(ShellState.get(first, 'one'), undefined);
+    assert.equal(ShellState.get(first, 'two'), undefined);
+    assert.equal(ShellState.get(second, 'one'), 3);
 });
 
 test('window liveness requires a compositor actor that has not been destroyed', () => {

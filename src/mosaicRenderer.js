@@ -8,9 +8,9 @@ import * as Logger from './logger.js';
 import * as Workspace from 'resource:///org/gnome/shell/ui/workspace.js';
 import {WINDOW_SPACING} from './constants.js';
 import {MosaicModel} from './mosaicModel.js';
-import {isWindowAlive} from './liveness.js';
-import * as WindowState from './windowState.js';
-import {IS_MINIATURE} from './windowState.js';
+import {isWindowAlive} from './shellState.js';
+import * as ShellState from './shellState.js';
+import {IS_MINIATURE} from './shellState.js';
 
 export class MosaicRenderer {
     constructor() {
@@ -61,7 +61,7 @@ export class MosaicRenderer {
             `[MODEL] Flushing ${modelEntries.length} slot(s) to WS-${workspace.index()} monitor ${monitor}`
         );
         for (const {window, slot} of modelEntries) {
-            if (!isWindowAlive(window) || WindowState.get(window, IS_MINIATURE)) continue;
+            if (!isWindowAlive(window) || ShellState.get(window, IS_MINIATURE)) continue;
             window.move_resize_frame(false, slot.x, slot.y, slot.width, slot.height);
         }
     }

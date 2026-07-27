@@ -10,8 +10,8 @@ import GLib from 'gi://GLib';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {SHOW_WINDOW_ANIMATION_TIME} from 'resource:///org/gnome/shell/ui/windowManager.js';
 import * as constants from './constants.js';
-import * as WindowState from './windowState.js';
-import {MINIATURE_ANIM_KIND} from './windowState.js';
+import * as ShellState from './shellState.js';
+import {MINIATURE_ANIM_KIND} from './shellState.js';
 import {getAnimationsEnabled, getSlowDownFactor} from './timing.js';
 import GObject from 'gi://GObject';
 
@@ -155,7 +155,7 @@ export const AnimationsManager = GObject.registerClass(
                     return;
                 }
 
-                WindowState.set(window, 'isMosaicResizing', true);
+                ShellState.set(window, 'isMosaicResizing', true);
                 // Apply the position synchronously before the combined request.
                 // Mutter may otherwise retain the actor's old allocation when only
                 // move_resize_frame is used with an unchanged size.
@@ -180,7 +180,7 @@ export const AnimationsManager = GObject.registerClass(
                     actor.set_translation(0, 0, 0);
                 }
                 if (firstPlacement) {
-                    WindowState.remove(window, 'pendingFirstPlacement');
+                    ShellState.remove(window, 'pendingFirstPlacement');
                     if (actor) actor.opacity = 255;
                 }
                 if (onComplete) onComplete();
@@ -190,7 +190,7 @@ export const AnimationsManager = GObject.registerClass(
             const windowActor = window.get_compositor_private();
             if (!windowActor) {
                 Logger.log(`No actor for window ${window.get_id()}, skipping animation`);
-                WindowState.set(window, 'isMosaicResizing', true);
+                ShellState.set(window, 'isMosaicResizing', true);
                 window.move_resize_frame(
                     false,
                     targetRect.x,
@@ -199,7 +199,7 @@ export const AnimationsManager = GObject.registerClass(
                     targetRect.height
                 );
                 this._clearMosaicResizingSoon(window);
-                if (firstPlacement) WindowState.remove(window, 'pendingFirstPlacement');
+                if (firstPlacement) ShellState.remove(window, 'pendingFirstPlacement');
                 if (onComplete) onComplete();
                 return;
             }
@@ -233,7 +233,7 @@ export const AnimationsManager = GObject.registerClass(
             // A miniature restore animates scale on this same actor and owns recovery
             // if we cut it off below (see continueScaleUp in miniature.js), so piling our
             // own scale ease on top would fight it for the same property.
-            const skipScale = WindowState.get(window, MINIATURE_ANIM_KIND) !== undefined;
+            const skipScale = ShellState.get(window, MINIATURE_ANIM_KIND) !== undefined;
 
             // remove_all_transitions fires old onStopped(isFinished=false);
             // the guard at the ease callback returns early without double cleanup.
@@ -277,7 +277,7 @@ export const AnimationsManager = GObject.registerClass(
                     ? (currentFrame.height * currentScaleY) / targetRect.height
                     : 1;
 
-            WindowState.set(window, 'isMosaicResizing', true);
+            ShellState.set(window, 'isMosaicResizing', true);
             // A pure move applies to the actor's allocation immediately, but a Wayland
             // client only commits a matching buffer for an actual size change some time
             // after the configure request, not synchronously here. Moving first, before
@@ -376,11 +376,11 @@ export const AnimationsManager = GObject.registerClass(
                     if (!isFinished) return; // redirect in progress; new animation owns cleanup
                     if (windowActor && !windowActor.is_destroyed())
                         windowActor.set_translation(0, 0, 0);
-                    if (firstPlacement) WindowState.remove(window, 'pendingFirstPlacement');
+                    if (firstPlacement) ShellState.remove(window, 'pendingFirstPlacement');
                     this._animatingWindows.delete(window.get_id());
                     this._animatingTargets.delete(window.get_id());
                     this._checkAllAnimationsComplete();
-                    WindowState.set(window, 'isMosaicResizing', false);
+                    ShellState.set(window, 'isMosaicResizing', false);
                     if (onComplete) onComplete();
                 },
             });
@@ -453,10 +453,8 @@ export const AnimationsManager = GObject.registerClass(
         animateReTiling(windowLayouts, draggedWindow = null, miniLayouts = []) {
             // A new window pushes siblings to make room; bounce those too, not just the entrant.
             const passHasEntrant =
-                windowLayouts.some(({window}) =>
-                    WindowState.get(window, 'pendingFirstPlacement')
-                ) ||
-                miniLayouts.some(({window}) => WindowState.get(window, 'pendingFirstPlacement'));
+                windowLayouts.some(({window}) => ShellState.get(window, 'pendingFirstPlacement')) ||
+                miniLayouts.some(({window}) => ShellState.get(window, 'pendingFirstPlacement'));
             const previousMembershipChangeBounce = this._membershipChangeBounce;
             if (passHasEntrant) this._membershipChangeBounce = true;
 
@@ -473,7 +471,7 @@ export const AnimationsManager = GObject.registerClass(
                 // here), since a single window-open burst can recurse through several
                 // tileWorkspaceWindows passes, and each one needs to still see this
                 // as a first placement, not just whichever pass happens to run first.
-                const isFirstPlacement = WindowState.get(window, 'pendingFirstPlacement');
+                const isFirstPlacement = ShellState.get(window, 'pendingFirstPlacement');
 
                 const currentRect = window.get_frame_rect();
                 const needsMove =
@@ -531,7 +529,7 @@ export const AnimationsManager = GObject.registerClass(
             if (siblings.length === 0) {
                 // Nothing to push against, so fall back to a workspace-switch cue, if any.
                 const ws = window.get_workspace();
-                const prevWSIndex = WindowState.get(window, 'previousWorkspace');
+                const prevWSIndex = ShellState.get(window, 'previousWorkspace');
                 if (ws && prevWSIndex !== undefined && prevWSIndex !== ws.index())
                     return {x: (prevWSIndex < ws.index() ? -1 : 1) * OFFSET * 3, y: 0};
                 return null;
@@ -583,7 +581,7 @@ export const AnimationsManager = GObject.registerClass(
             this._timeoutRegistry.add(
                 constants.RESIZE_SETTLE_DELAY_MS,
                 () => {
-                    WindowState.set(window, 'isMosaicResizing', false);
+                    ShellState.set(window, 'isMosaicResizing', false);
                     return GLib.SOURCE_REMOVE;
                 },
                 'animations_clearMosaicResizing'

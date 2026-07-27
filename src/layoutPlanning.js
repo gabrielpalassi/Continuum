@@ -2,6 +2,29 @@
 // Pure layout-policy helpers. Keeping these independent of GNOME APIs makes the
 // state-machine decisions testable without a running Shell.
 
+// Every ordered composition of n into 1..n groups (n=3 gives [3],[1,2],[2,1],[1,1,1]).
+// Keep this lazy: the count is 2^(n-1), and callers stop when their time budget expires.
+export function* generateRowCompositions(n) {
+    if (n <= 0) return;
+
+    function* build(remaining, groupsLeft, acc) {
+        if (remaining === 0) {
+            yield acc.slice();
+            return;
+        }
+        if (groupsLeft === 0) return;
+
+        const maxFirst = groupsLeft === 1 ? remaining : remaining - (groupsLeft - 1);
+        for (let first = 1; first <= maxFirst; first++) {
+            acc.push(first);
+            yield* build(remaining - first, groupsLeft - 1, acc);
+            acc.pop();
+        }
+    }
+
+    for (let groups = 1; groups <= n; groups++) yield* build(n, groups, []);
+}
+
 export function orderWindowsByMru(windows, mru, {mostRecentFirst = true} = {}) {
     const unknownRank = Number.MAX_SAFE_INTEGER;
     const rank = window => {
@@ -22,8 +45,17 @@ export function restoreBeforeRearrange(tryRestore, rearrange) {
     return false;
 }
 
-export function enumerateTileSlots(tileInfo, workArea, spacing) {
+export function enumerateTileSlots(tileInfo, workArea, spacing, bounds = null) {
     const slots = [];
+    const boundedRect = descriptor => {
+        let x = descriptor.x;
+        let y = descriptor.y;
+        if (bounds) {
+            x = Math.max(bounds.x, Math.min(x, bounds.x + bounds.width - descriptor.width));
+            y = Math.max(bounds.y, Math.min(y, bounds.y + bounds.height - descriptor.height));
+        }
+        return {x, y, width: descriptor.width, height: descriptor.height};
+    };
 
     if (!tileInfo.vertical) {
         let y = tileInfo.y;
@@ -37,7 +69,12 @@ export function enumerateTileSlots(tileInfo, workArea, spacing) {
                 slots.push({
                     descriptor,
                     orientation: 'H',
-                    rect: {x, y: y + yOffset, width: descriptor.width, height: descriptor.height},
+                    rect: boundedRect({
+                        x: descriptor.targetX !== undefined ? descriptor.targetX : x,
+                        y: descriptor.targetY !== undefined ? descriptor.targetY : y + yOffset,
+                        width: descriptor.width,
+                        height: descriptor.height,
+                    }),
                 });
                 x += descriptor.width + spacing;
             }
@@ -51,12 +88,12 @@ export function enumerateTileSlots(tileInfo, workArea, spacing) {
                 slots.push({
                     descriptor,
                     orientation: 'V',
-                    rect: {
+                    rect: boundedRect({
                         x: descriptor.targetX !== undefined ? descriptor.targetX : x,
                         y: descriptor.targetY !== undefined ? descriptor.targetY : y,
                         width: descriptor.width,
                         height: descriptor.height,
-                    },
+                    }),
                 });
                 y += descriptor.height + spacing;
             }

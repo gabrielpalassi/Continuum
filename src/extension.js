@@ -21,18 +21,17 @@ import * as constants from './constants.js';
 import {SettingsOverrider} from './settingsOverrider.js';
 import {EdgeTilingManager} from './edgeTiling.js';
 import {TilingManager} from './tiling.js';
-import {isWindowAlive, isWorkspaceAlive} from './liveness.js';
-import {ReorderingManager} from './reordering.js';
+import {isWindowAlive, isWorkspaceAlive} from './shellState.js';
 import {SwappingManager} from './swapping.js';
 import {DrawingManager} from './drawing.js';
 import {AnimationsManager} from './animations.js';
 import {MosaicLayoutStrategy, MosaicRenderer} from './mosaicRenderer.js';
 import {TimeoutRegistry, createDebounced} from './timing.js';
 import {WindowHandler} from './windowHandler.js';
-import {DragHandler} from './dragHandler.js';
+import {GrabHandler} from './grabHandler.js';
 import {ResizeHandler} from './resizeHandler.js';
 import {MiniatureManager} from './miniature.js';
-import * as WindowState from './windowState.js';
+import * as ShellState from './shellState.js';
 import {
     IS_MINIATURE,
     MINIATURE_SCALE,
@@ -40,7 +39,7 @@ import {
     MINIATURE_EXT_TOP,
     MINIATURE_TARGET_POS,
     MINIATURE_OVERLAY,
-} from './windowState.js';
+} from './shellState.js';
 import {WorkspaceOverviewManager} from './workspaceOverview.js';
 import {WindowAttentionManager} from './windowAttention.js';
 
@@ -62,7 +61,6 @@ export default class ContinuumExtension extends Extension {
 
         this.edgeTilingManager = null;
         this.tilingManager = null;
-        this.reorderingManager = null;
         this.swappingManager = null;
         this.drawingManager = null;
         this.animationsManager = null;
@@ -70,7 +68,7 @@ export default class ContinuumExtension extends Extension {
         this.windowingManager = null;
 
         this.windowHandler = null;
-        this.dragHandler = null;
+        this.grabHandler = null;
         this.resizeHandler = null;
         this.workspaceOverviewManager = null;
         this.windowAttentionManager = null;
@@ -94,11 +92,16 @@ export default class ContinuumExtension extends Extension {
         this._timeoutRegistry = null;
     }
 
-    _tileWindowWorkspace(meta_window) {
-        if (!meta_window) return;
-        const workspace = meta_window.get_workspace();
-        if (!workspace) return;
-        this.tilingManager.tileWorkspaceWindows(workspace, meta_window, null, false);
+    get timeoutRegistry() {
+        return this._timeoutRegistry;
+    }
+
+    get isOverflowInProgress() {
+        return this._overflowInProgress;
+    }
+
+    forgetMiniatureCascade(window) {
+        this._miniatureCascadeIds?.delete(window.get_id());
     }
 
     _tileAllWorkspaces = () => {
@@ -169,7 +172,6 @@ export default class ContinuumExtension extends Extension {
         this.edgeTilingManager = new EdgeTilingManager();
         this.tilingManager = new TilingManager();
         this.tilingManager.setExtension(this);
-        this.reorderingManager = new ReorderingManager();
         this.swappingManager = new SwappingManager({
             tilingManager: this.tilingManager,
             edgeTilingManager: this.edgeTilingManager,
@@ -192,11 +194,6 @@ export default class ContinuumExtension extends Extension {
         this.tilingManager.setAnimationsManager(this.animationsManager);
         this.tilingManager.setWindowingManager(this.windowingManager);
 
-        this.reorderingManager.setTilingManager(this.tilingManager);
-        this.reorderingManager.setEdgeTilingManager(this.edgeTilingManager);
-        this.reorderingManager.setAnimationsManager(this.animationsManager);
-        this.reorderingManager.setWindowingManager(this.windowingManager);
-
         this.drawingManager.setEdgeTilingManager(this.edgeTilingManager);
 
         this.edgeTilingManager.setAnimationsManager(this.animationsManager);
@@ -206,7 +203,7 @@ export default class ContinuumExtension extends Extension {
         this.animationsManager.setTimeoutRegistry(this._timeoutRegistry);
 
         this.windowHandler = new WindowHandler(this);
-        this.dragHandler = new DragHandler(this);
+        this.grabHandler = new GrabHandler(this);
         this.resizeHandler = new ResizeHandler(this);
         this.workspaceOverviewManager = new WorkspaceOverviewManager({
             workspaceManager: this._workspaceManager,
@@ -239,7 +236,7 @@ export default class ContinuumExtension extends Extension {
             this._dndScheduleRestore = createDebounced(
                 window => {
                     this._dndPendingWindowId = null;
-                    if (isWindowAlive(window) && WindowState.get(window, WindowState.IS_MINIATURE))
+                    if (isWindowAlive(window) && ShellState.get(window, ShellState.IS_MINIATURE))
                         this.miniatureManager?.restoreMiniature(window, null);
                 },
                 constants.DND_MINIATURE_RESTORE_DELAY_MS,
@@ -335,11 +332,11 @@ export default class ContinuumExtension extends Extension {
                 if (!wsGroup._windowRecords) continue;
                 for (const record of wsGroup._windowRecords) {
                     const metaWindow = record.windowActor.meta_window;
-                    if (WindowState.get(metaWindow, IS_MINIATURE)) {
-                        const tgt = WindowState.get(metaWindow, MINIATURE_TARGET_POS);
-                        const sc = WindowState.get(metaWindow, MINIATURE_SCALE);
-                        const extL = WindowState.get(metaWindow, MINIATURE_EXT_LEFT) ?? 0;
-                        const extT = WindowState.get(metaWindow, MINIATURE_EXT_TOP) ?? 0;
+                    if (ShellState.get(metaWindow, IS_MINIATURE)) {
+                        const tgt = ShellState.get(metaWindow, MINIATURE_TARGET_POS);
+                        const sc = ShellState.get(metaWindow, MINIATURE_SCALE);
+                        const extL = ShellState.get(metaWindow, MINIATURE_EXT_LEFT) ?? 0;
+                        const extT = ShellState.get(metaWindow, MINIATURE_EXT_TOP) ?? 0;
                         if (tgt && sc) {
                             record.clone.set_pivot_point(0, 0);
                             record.clone.set_scale(sc, sc);
@@ -350,7 +347,7 @@ export default class ContinuumExtension extends Extension {
                         // _createClone only ever sees the window actor, and the icon
                         // overlay is its sibling, so the icon would vanish for the whole
                         // slide. The overlay already sits at frame scale, hence no set_scale.
-                        const overlay = WindowState.get(metaWindow, MINIATURE_OVERLAY);
+                        const overlay = ShellState.get(metaWindow, MINIATURE_OVERLAY);
                         if (overlay && tgt) {
                             const iconClone = new Clutter.Clone({
                                 source: overlay,
@@ -390,9 +387,9 @@ export default class ContinuumExtension extends Extension {
             configurable: true,
             get() {
                 const mw = this.metaWindow;
-                if (mw && WindowState.get(mw, IS_MINIATURE)) {
-                    const tgt = WindowState.get(mw, MINIATURE_TARGET_POS);
-                    const sc = WindowState.get(mw, MINIATURE_SCALE);
+                if (mw && ShellState.get(mw, IS_MINIATURE)) {
+                    const tgt = ShellState.get(mw, MINIATURE_TARGET_POS);
+                    const sc = ShellState.get(mw, MINIATURE_SCALE);
                     if (tgt && sc) {
                         const f = mw.get_frame_rect();
                         return {
@@ -423,7 +420,7 @@ export default class ContinuumExtension extends Extension {
             originalMethod => {
                 return function (...args) {
                     originalMethod.apply(this, args);
-                    if (this._mosaicIconLift && WindowState.get(this.metaWindow, IS_MINIATURE))
+                    if (this._mosaicIconLift && ShellState.get(this.metaWindow, IS_MINIATURE))
                         this._icon.translation_y += this._mosaicIconLift;
                 };
             }
@@ -450,7 +447,7 @@ export default class ContinuumExtension extends Extension {
 
                 if (
                     !mw ||
-                    !WindowState.get(mw, IS_MINIATURE) ||
+                    !ShellState.get(mw, IS_MINIATURE) ||
                     !throughPicker ||
                     currentState > 1
                 ) {
@@ -611,12 +608,12 @@ export default class ContinuumExtension extends Extension {
         );
         this._displayEventIds.push(
             global.display.connect('grab-op-begin', (display, window, grabpo) =>
-                this.dragHandler._grabOpBeginHandler(display, window, grabpo)
+                this.grabHandler.onGrabOpBegin(display, window, grabpo)
             )
         );
         this._displayEventIds.push(
             global.display.connect('grab-op-end', (display, window, grabpo) =>
-                this.dragHandler._grabOpEndHandler(display, window, grabpo)
+                this.grabHandler.onGrabOpEnd(display, window, grabpo)
             )
         );
         this._displayEventIds.push(
@@ -706,12 +703,12 @@ export default class ContinuumExtension extends Extension {
         if (!this.windowingManager.isRelated(window)) return;
         if (this.windowingManager.isExcluded(window)) return;
         if (this.windowingManager.isMaximizedOrFullscreen(window)) return;
-        if (!WindowState.get(window, IS_MINIATURE)) return;
-        if (WindowState.get(window, 'justMiniaturized')) {
+        if (!ShellState.get(window, IS_MINIATURE)) return;
+        if (ShellState.get(window, 'justMiniaturized')) {
             Logger.log(`[FOCUS] Skip restore ${window.get_id()}: justMiniaturized`);
             return;
         }
-        if (this.tilingManager._isSmartResizingBlocked) {
+        if (this.tilingManager.isSmartResizingBlocked) {
             Logger.log(`[FOCUS] Skip restore ${window.get_id()}: smartResizingBlocked`);
             return;
         }
@@ -734,8 +731,7 @@ export default class ContinuumExtension extends Extension {
                     .getMonitorWorkspaceWindows(ws, mon)
                     .find(
                         w =>
-                            !WindowState.get(w, IS_MINIATURE) &&
-                            !this.windowingManager.isExcluded(w)
+                            !ShellState.get(w, IS_MINIATURE) && !this.windowingManager.isExcluded(w)
                     );
                 Logger.log(
                     `[FOCUS] Block cascade restore ${windowId} → activating ${nonMiniature?.get_id() ?? 'none'}`
@@ -747,8 +743,8 @@ export default class ContinuumExtension extends Extension {
 
         Logger.log(`[FOCUS] Triggering restore ${windowId}`);
         this._miniatureCascadeIds.clear();
-        this.tilingManager._isSmartResizingBlocked = true;
-        WindowState.set(window, 'restoringFromMiniature', true);
+        this.tilingManager.setSmartResizeGuard(true);
+        ShellState.set(window, 'restoringFromMiniature', true);
 
         this.miniatureManager.restoreMiniature(window, null);
         // 'miniature-restored' signal fires synchronously → _onMiniatureRestored runs next
@@ -762,8 +758,8 @@ export default class ContinuumExtension extends Extension {
         Logger.log(
             `[FOCUS] _onMiniatureRestored ${window.get_id()} (${window.get_wm_class?.() ?? '?'}): running smart resize`
         );
-        WindowState.remove(window, 'restoringFromMiniature');
-        this.tilingManager._isSmartResizingBlocked = false;
+        ShellState.remove(window, 'restoringFromMiniature');
+        this.tilingManager.setSmartResizeGuard(false);
 
         const workspace = window.get_workspace();
         if (!workspace) return;
@@ -771,7 +767,7 @@ export default class ContinuumExtension extends Extension {
         // Preview cleanup restores multiple miniatures synchronously. The drag's
         // final retile owns their layout; running this pass for every restore can
         // re-miniaturize them mid-cleanup and cause a retile storm.
-        if (this.dragHandler?._suppressRestoreRetile) return;
+        if (this.grabHandler?.isRestoreRetileSuppressed) return;
 
         const monitor = window.get_monitor();
         const workArea = this.tilingManager.getUsableWorkArea(workspace, monitor);
@@ -783,7 +779,7 @@ export default class ContinuumExtension extends Extension {
                     isWindowAlive(w) &&
                     w.get_id() !== window.get_id() &&
                     !this.edgeTilingManager.isEdgeTiled(w) &&
-                    !WindowState.get(w, 'pendingInQueue') &&
+                    !ShellState.get(w, 'pendingInQueue') &&
                     !this.windowingManager.isExcluded(w) &&
                     !this.windowingManager.isMaximizedOrFullscreen(w)
             );
@@ -802,15 +798,11 @@ export default class ContinuumExtension extends Extension {
 
         const doTile = () => {
             if (resizeResult?.success) {
-                this.tilingManager._isSmartResizingBlocked = true;
-                this.tilingManager._restoringWindowId = window.get_id();
-                try {
-                    this.tilingManager._pendingMiniatureWindows = resizeResult.pendingWindows ?? [];
-                    this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
-                } finally {
-                    this.tilingManager._isSmartResizingBlocked = false;
-                    this.tilingManager._restoringWindowId = null;
-                }
+                this.tilingManager.runSmartResizeTile(workspace, {
+                    monitor,
+                    pendingWindows: resizeResult.pendingWindows,
+                    restoringWindow: window,
+                });
             } else {
                 this.tilingManager.tileWorkspaceWindows(workspace, window, monitor, false);
             }
@@ -831,7 +823,7 @@ export default class ContinuumExtension extends Extension {
                     constants.RESIZE_SETTLE_DELAY_MS,
                     () => {
                         for (const w of allWindows) {
-                            WindowState.remove(w, 'isReverseSmartResizing');
+                            ShellState.remove(w, 'isReverseSmartResizing');
                         }
                         this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, true);
                         return GLib.SOURCE_REMOVE;
@@ -1055,20 +1047,18 @@ export default class ContinuumExtension extends Extension {
         // Clean up handler classes before nulling shared refs, since their destroy()
         // reaches the timeout registry through the extension reference.
         if (this.resizeHandler) this.resizeHandler.destroy();
-        if (this.dragHandler) this.dragHandler.destroy();
+        if (this.grabHandler) this.grabHandler.destroy();
         if (this.windowHandler?.destroy) this.windowHandler.destroy();
         this.windowHandler = null;
-        this.dragHandler = null;
+        this.grabHandler = null;
         this.resizeHandler = null;
 
         if (this.tilingManager) this.tilingManager.destroy();
-        if (this.reorderingManager) this.reorderingManager.destroy();
         if (this.swappingManager) this.swappingManager.destroy();
         if (this.windowingManager) this.windowingManager.destroy();
 
         this.tilingManager = null;
         this.edgeTilingManager = null;
-        this.reorderingManager = null;
         this.swappingManager = null;
         this.drawingManager = null;
         this.animationsManager = null;

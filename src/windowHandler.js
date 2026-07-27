@@ -11,10 +11,10 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Logger from './logger.js';
 import * as constants from './constants.js';
 import {TileZone} from './constants.js';
-import * as WindowState from './windowState.js';
-import {IS_MINIATURE} from './windowState.js';
+import * as ShellState from './shellState.js';
+import {IS_MINIATURE} from './shellState.js';
 import {MosaicModel} from './mosaicModel.js';
-import {isWindowAlive, isWorkspaceAlive} from './liveness.js';
+import {isWindowAlive, isWorkspaceAlive} from './shellState.js';
 import {orderWindowsByMru, restoreBeforeRearrange} from './layoutPlanning.js';
 import {afterWorkspaceSwitch, afterAnimations, afterWindowClose, monotonicNow} from './timing.js';
 
@@ -33,7 +33,7 @@ export class WindowHandler {
 
     destroy() {
         for (const entry of this._evaluationQueue)
-            WindowState.remove(entry.window, 'pendingInQueue');
+            ShellState.remove(entry.window, 'pendingInQueue');
         this._evaluationQueue = [];
         this._isEvaluatingQueue = false;
         this._scheduledMonitorRebalances = [];
@@ -71,8 +71,8 @@ export class WindowHandler {
     // be their only way back to visible.
     shouldSkipSlideIn(window) {
         return (
-            WindowState.get(window, 'movedByOverflow') ||
-            this._ext._overflowInProgress ||
+            ShellState.get(window, 'movedByOverflow') ||
+            this._ext.isOverflowInProgress ||
             this.windowingManager.isMaximizedOrFullscreen(window) ||
             this.windowingManager.isExcludedByPolicy(window) ||
             !this._hasSiblings(window)
@@ -100,16 +100,16 @@ export class WindowHandler {
     }
 
     _revealPendingMonitorPlacementEntrance(window) {
-        if (!WindowState.get(window, 'monitorPlacementEntrancePending')) return;
-        WindowState.remove(window, 'monitorPlacementEntrancePending');
+        if (!ShellState.get(window, 'monitorPlacementEntrancePending')) return;
+        ShellState.remove(window, 'monitorPlacementEntrancePending');
         this.animationsManager.animateMonitorPlacementEntrance(window);
     }
 
     // Floating windows never enter the tile pass that would clear opacity=0;
     // reveal so the slide-in failsafe isn't their only path to visibility.
     revealPendingEntrance(window) {
-        if (!WindowState.get(window, 'pendingFirstPlacement')) return;
-        WindowState.remove(window, 'pendingFirstPlacement');
+        if (!ShellState.get(window, 'pendingFirstPlacement')) return;
+        ShellState.remove(window, 'pendingFirstPlacement');
         this.animationsManager.cancelPendingEntrance(window);
         const actor = isWindowAlive(window) ? window.get_compositor_private() : null;
         if (actor && !actor.is_destroyed()) {
@@ -163,7 +163,7 @@ export class WindowHandler {
         return this._ext.animationsManager;
     }
     get _timeoutRegistry() {
-        return this._ext._timeoutRegistry;
+        return this._ext.timeoutRegistry;
     }
 
     connectWindowSignals(window) {
@@ -177,7 +177,7 @@ export class WindowHandler {
                 Logger.log(`Window ${win.get_id()} (unmanaged) - cleaning up`);
                 // Distinguish a real close from workspace/monitor removal before the
                 // generic window-removed timeout gets a chance to re-tile locally.
-                WindowState.set(win, 'closeFinalizationPending', true);
+                ShellState.set(win, 'closeFinalizationPending', true);
                 this.animationsManager.removeAnimatingWindow(win.get_id());
                 const ws = win.get_workspace();
                 if (ws) this.onWindowRemoved(ws, win);
@@ -201,16 +201,16 @@ export class WindowHandler {
                         // backup for apps where that signal doesn't fire reliably; calling
                         // these twice for the same transition is safe (see resizeHandler.js).
                         if (this.windowingManager.isMaximizedOrFullscreen(win)) {
-                            if (!WindowState.get(win, 'openedMaximized')) {
+                            if (!ShellState.get(win, 'openedMaximized')) {
                                 this._ext.resizeHandler.tryEnterSacred(win);
                             }
-                        } else if (WindowState.get(win, 'openedMaximized')) {
+                        } else if (ShellState.get(win, 'openedMaximized')) {
                             Logger.log(
                                 `Window ${win.get_id()} born maximized - skipping sacred exit, treating as normal unmaximize`
                             );
-                            WindowState.remove(win, 'openedMaximized');
-                            WindowState.remove(win, 'unmaximizing');
-                            WindowState.remove(win, 'isEnteringSacred');
+                            ShellState.remove(win, 'openedMaximized');
+                            ShellState.remove(win, 'unmaximizing');
+                            ShellState.remove(win, 'isEnteringSacred');
                             this.settleSacredExit(win, 'unmaximize');
                         } else {
                             this._ext.resizeHandler.tryExitSacred(win);
@@ -225,16 +225,16 @@ export class WindowHandler {
         ids.push(
             window.connect('notify::fullscreen', win => {
                 if (this.windowingManager.isMaximizedOrFullscreen(win)) {
-                    if (!WindowState.get(win, 'openedMaximized')) {
+                    if (!ShellState.get(win, 'openedMaximized')) {
                         this._ext.resizeHandler.tryEnterSacred(win);
                     }
-                } else if (WindowState.get(win, 'openedMaximized')) {
+                } else if (ShellState.get(win, 'openedMaximized')) {
                     Logger.log(
                         `Window ${win.get_id()} born fullscreen - skipping sacred exit, treating as normal`
                     );
-                    WindowState.remove(win, 'openedMaximized');
-                    WindowState.remove(win, 'unmaximizing');
-                    WindowState.remove(win, 'isEnteringSacred');
+                    ShellState.remove(win, 'openedMaximized');
+                    ShellState.remove(win, 'unmaximizing');
+                    ShellState.remove(win, 'isEnteringSacred');
                     this.settleSacredExit(win, 'unfullscreen');
                 } else {
                     this._ext.resizeHandler.tryExitSacred(win);
@@ -246,14 +246,14 @@ export class WindowHandler {
             window.connect('size-changed', win => {
                 MosaicModel.forget(win);
                 if (
-                    WindowState.get(win, 'isSmartResizing') ||
-                    WindowState.get(win, 'isReverseSmartResizing')
+                    ShellState.get(win, 'isSmartResizing') ||
+                    ShellState.get(win, 'isReverseSmartResizing')
                 ) {
                     // During queue evaluation, skip all processing so target sizes stay
                     // consistent for subsequent canFitWindow/tryFitWithResize calls
                     if (this._isEvaluatingQueue) return;
-                    const target = WindowState.get(win, 'targetSmartResizeSize');
-                    if (target) WindowState.set(win, 'targetSmartResizeSize', null);
+                    const target = ShellState.get(win, 'targetSmartResizeSize');
+                    if (target) ShellState.set(win, 'targetSmartResizeSize', null);
                     this.tilingManager.tileWorkspaceWindows(
                         win.get_workspace(),
                         null,
@@ -266,6 +266,7 @@ export class WindowHandler {
         ids.push(
             window.connect('position-changed', win => {
                 MosaicModel.forget(win);
+                this.edgeTilingManager.ensureTileAnchored(win);
             })
         );
 
@@ -278,11 +279,11 @@ export class WindowHandler {
         this._windowSignals.set(window, ids);
 
         const currentExclusion = this.windowingManager.isExcluded(window);
-        WindowState.set(window, 'previousExclusionState', currentExclusion);
+        ShellState.set(window, 'previousExclusionState', currentExclusion);
 
         const currentWorkspace = window.get_workspace();
         if (currentWorkspace) {
-            WindowState.set(window, 'previousWorkspace', currentWorkspace.index());
+            ShellState.set(window, 'previousWorkspace', currentWorkspace.index());
         }
     }
 
@@ -296,17 +297,17 @@ export class WindowHandler {
 
         MosaicModel.forget(window);
 
-        WindowState.remove(window, 'previousExclusionState');
-        WindowState.remove(window, 'previousWorkspace');
+        ShellState.remove(window, 'previousExclusionState');
+        ShellState.remove(window, 'previousWorkspace');
     }
 
     // The size-change signal arrives before Mutter commits the restored frame. Mark the
     // transition so the subsequent compositor size-changed handler can center it and
     // retarget Shell's already-prepared animation before the next paint.
     settleSacredExit(win, label) {
-        WindowState.set(win, 'pendingSacredExitPosition', label);
+        ShellState.set(win, 'pendingSacredExitPosition', label);
         const source = win.get_frame_rect();
-        WindowState.set(win, 'pendingSacredExitAnimationSource', {
+        ShellState.set(win, 'pendingSacredExitAnimationSource', {
             x: source.x,
             y: source.y,
             width: source.width,
@@ -322,7 +323,7 @@ export class WindowHandler {
             () => {
                 if (
                     isWindowAlive(win) &&
-                    WindowState.get(win, 'pendingSacredExitPosition') !== undefined
+                    ShellState.get(win, 'pendingSacredExitPosition') !== undefined
                 )
                     this.commitSacredExitPosition(win, {allowUnsettled: true});
                 return GLib.SOURCE_REMOVE;
@@ -332,7 +333,7 @@ export class WindowHandler {
     }
 
     commitSacredExitPosition(win, {allowUnsettled = false} = {}) {
-        const label = WindowState.get(win, 'pendingSacredExitPosition');
+        const label = ShellState.get(win, 'pendingSacredExitPosition');
         if (label === undefined || !isWindowAlive(win)) return false;
 
         const ws = win.get_workspace();
@@ -346,7 +347,7 @@ export class WindowHandler {
         // an intermediate frame that still has a maximized dimension; the following
         // size-changed signal will carry the complete restore. The timed fallback
         // permits a genuinely clamped client to settle anyway.
-        const targetSize = WindowState.get(win, 'targetRestoredSize');
+        const targetSize = ShellState.get(win, 'targetRestoredSize');
         if (targetSize && !allowUnsettled) {
             const widthStillMaximized =
                 targetSize.width < area.width - constants.ANIMATION_DIFF_THRESHOLD &&
@@ -359,10 +360,10 @@ export class WindowHandler {
 
         const x = Math.round(area.x + (area.width - frame.width) / 2);
         const y = Math.round(area.y + (area.height - frame.height) / 2);
-        const source = WindowState.get(win, 'pendingSacredExitAnimationSource');
+        const source = ShellState.get(win, 'pendingSacredExitAnimationSource');
         win.move_frame(true, x, y);
-        WindowState.remove(win, 'pendingSacredExitPosition');
-        WindowState.remove(win, 'pendingSacredExitAnimationSource');
+        ShellState.remove(win, 'pendingSacredExitPosition');
+        ShellState.remove(win, 'pendingSacredExitAnimationSource');
 
         // Let Shell finish its native transform before synchronizing Mosaic's model.
         // The real frame is already at the calculated solo position, so this pass is
@@ -404,7 +405,7 @@ export class WindowHandler {
         // Shell cross-fades an old-frame clone alongside the real actor. Its native
         // x/y transitions can also start from Shell's stale oldRect. Rebase both ends
         // in place; its native opacity and scale transitions continue untouched.
-        const clone = animationInfo.clone?.actor ?? animationInfo.clone;
+        const clone = animationInfo?.clone?.actor ?? animationInfo?.clone;
         if (clone) {
             retargetTransition(clone, 'x', source.x, target.x);
             retargetTransition(clone, 'y', source.y, target.y);
@@ -418,7 +419,7 @@ export class WindowHandler {
         const mon = win.get_monitor();
         // Only capture if nothing's recorded yet, so a later manual resize or
         // Smart Resize decision is never clobbered.
-        if (!WindowState.get(win, 'preferredSize')) {
+        if (!ShellState.get(win, 'preferredSize')) {
             const settled = win.get_frame_rect();
             const wa = ws && mon !== null ? ws.get_work_area_for_monitor(mon) : null;
             // A client that stays monitor-sized through the exit leaves a frame
@@ -428,7 +429,7 @@ export class WindowHandler {
             const size = isMonitorSized
                 ? {width: Math.floor(wa.width * 0.95), height: Math.floor(wa.height * 0.95)}
                 : {width: settled.width, height: settled.height};
-            WindowState.set(win, 'preferredSize', size);
+            ShellState.set(win, 'preferredSize', size);
             Logger.log(
                 `Captured preferredSize on ${label} for ${win.get_id()}: ${size.width}x${size.height}${isMonitorSized ? ' (95% fallback, no real shrink)' : ''}`
             );
@@ -444,8 +445,18 @@ export class WindowHandler {
 
         const isNowExcluded = this.windowingManager.isExcluded(window);
 
-        const wasExcluded = WindowState.get(window, 'previousExclusionState') || false;
-        WindowState.set(window, 'previousExclusionState', isNowExcluded);
+        const wasExcluded = ShellState.get(window, 'previousExclusionState') || false;
+        ShellState.set(window, 'previousExclusionState', isNowExcluded);
+
+        // Mutter toggles on-all-workspaces while moving a window between monitors
+        // under workspaces-only-on-primary. That is part of the internal placement
+        // transaction, not a real exclusion change; its completion owns both retiles.
+        if (ShellState.get(window, 'monitorPlacementTarget') !== undefined) {
+            Logger.log(
+                `Ignoring exclusion transition for window ${windowId} during monitor placement`
+            );
+            return;
+        }
 
         if (wasExcluded === isNowExcluded) {
             return;
@@ -489,7 +500,7 @@ export class WindowHandler {
                             constants.RESIZE_SETTLE_DELAY_MS,
                             () => {
                                 for (const w of remainingWindows) {
-                                    WindowState.remove(w, 'isReverseSmartResizing');
+                                    ShellState.remove(w, 'isReverseSmartResizing');
                                 }
                                 return GLib.SOURCE_REMOVE;
                             },
@@ -517,7 +528,7 @@ export class WindowHandler {
 
                 if (this.tilingManager.canFitWindow(window, workspace, monitor)) {
                     Logger.log('Re-included window fits without resize');
-                    WindowState.set(window, 'justReturnedFromExclusion', true);
+                    ShellState.set(window, 'justReturnedFromExclusion', true);
                     this.tilingManager.tileWorkspaceWindows(workspace, window, monitor, false);
                     return GLib.SOURCE_REMOVE;
                 }
@@ -536,15 +547,11 @@ export class WindowHandler {
 
                 if (resizeResult?.success) {
                     Logger.log('Re-include: Smart resize applied - tiling workspace');
-                    WindowState.set(window, 'justReturnedFromExclusion', true);
-                    this.tilingManager._isSmartResizingBlocked = true;
-                    try {
-                        this.tilingManager._pendingMiniatureWindows =
-                            resizeResult.pendingWindows ?? [];
-                        this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
-                    } finally {
-                        this.tilingManager._isSmartResizingBlocked = false;
-                    }
+                    ShellState.set(window, 'justReturnedFromExclusion', true);
+                    this.tilingManager.runSmartResizeTile(workspace, {
+                        monitor,
+                        pendingWindows: resizeResult.pendingWindows,
+                    });
                 } else {
                     Logger.log('Re-include: Smart resize not applicable - moving to overflow');
                     this.windowingManager
@@ -560,12 +567,12 @@ export class WindowHandler {
     onWindowLeftMonitor(monitor, window) {
         if (!this._windowSignals.has(window)) return;
 
-        if (WindowState.get(window, 'monitorPlacementTarget') !== undefined) {
+        if (ShellState.get(window, 'monitorPlacementTarget') !== undefined) {
             this.windowingManager.invalidateWindowsCache();
             return;
         }
 
-        if (WindowState.get(window, 'monitorRebalanceInProgress')) {
+        if (ShellState.get(window, 'monitorRebalanceInProgress')) {
             this.windowingManager.invalidateWindowsCache();
             return;
         }
@@ -578,20 +585,20 @@ export class WindowHandler {
         // Internal placement has its own source/target transaction. Everything else
         // is an explicit compositor/user move, so remember the vacancy it creates;
         // an occupied sacred destination can give its incumbent that vacancy.
-        WindowState.set(window, 'userMoveOrigin', {workspace, monitor});
+        ShellState.set(window, 'userMoveOrigin', {workspace, monitor});
 
         Logger.log(`Window ${window.get_id()} left monitor ${monitor}`);
 
         // onWindowRemoved runs before this signal and can only see the destination
         // monitor, so leave the source behind for its deferred count to pick up.
-        WindowState.set(window, 'leftMonitor', monitor);
-        WindowState.set(window, 'leftMonitorAt', monotonicNow());
+        ShellState.set(window, 'leftMonitor', monitor);
+        ShellState.set(window, 'leftMonitorAt', monotonicNow());
 
         this.windowingManager.invalidateWindowsCache();
 
         // Under a grab the drag passes own the layout; retiling here on top of them feeds
         // reverse smart resize back into tiling forever. stopDrag retiles the source.
-        if (this._ext.dragHandler._draggedWindow) return;
+        if (this._ext.grabHandler.draggedWindow) return;
 
         this._timeoutRegistry.add(
             constants.RETILE_DELAY_MS,
@@ -630,14 +637,15 @@ export class WindowHandler {
         );
     }
 
-    _moveWindowToMonitorAndWait(window, workspace, sourceMonitor, targetMonitor) {
+    _moveWindowToMonitorAndWait(window, workspace, sourceMonitor, targetMonitor, options = {}) {
         return new Promise(resolve => {
             const started = this.windowingManager.moveWindowToMonitor(
                 window,
                 workspace,
                 sourceMonitor,
                 targetMonitor,
-                resolve
+                resolve,
+                options
             );
             if (!started) resolve(false);
         });
@@ -660,8 +668,8 @@ export class WindowHandler {
                 ),
             mru
         ).sort((a, b) => {
-            const aMiniature = WindowState.get(a, IS_MINIATURE) ? 0 : 1;
-            const bMiniature = WindowState.get(b, IS_MINIATURE) ? 0 : 1;
+            const aMiniature = ShellState.get(a, IS_MINIATURE) ? 0 : 1;
+            const bMiniature = ShellState.get(b, IS_MINIATURE) ? 0 : 1;
             return aMiniature - bMiniature;
         });
 
@@ -700,7 +708,7 @@ export class WindowHandler {
             if (
                 targetWorkspace &&
                 settledMonitor !== null &&
-                WindowState.get(sibling, IS_MINIATURE)
+                ShellState.get(sibling, IS_MINIATURE)
             ) {
                 this.windowingManager.invalidateWindowsCache();
                 const targetWindows = this.windowingManager
@@ -724,14 +732,14 @@ export class WindowHandler {
     onWindowEnteredMonitor(monitor, window) {
         if (!this._windowSignals.has(window)) return;
 
-        if (WindowState.get(window, 'monitorPlacementTarget') !== undefined) {
+        if (ShellState.get(window, 'monitorPlacementTarget') !== undefined) {
             // move_to_monitor updates MetaWindow asynchronously. The placement
             // timeout owns the one destination retile after the frame settles.
             this.windowingManager.invalidateWindowsCache();
             return;
         }
 
-        if (WindowState.get(window, 'monitorRebalanceInProgress')) {
+        if (ShellState.get(window, 'monitorRebalanceInProgress')) {
             this.windowingManager.invalidateWindowsCache();
             return;
         }
@@ -739,7 +747,7 @@ export class WindowHandler {
         // A grab drag ends in stopDrag, which tiles the destination itself. Overview
         // drags, keyboard moves and monitor hotplug have no grab, so this is the only
         // place that gets the arriving window into the mosaic.
-        if (this._ext.dragHandler._draggedWindow) return;
+        if (this._ext.grabHandler.draggedWindow) return;
 
         // An on-all-workspaces window reports no workspace of its own, but it does show
         // up in every workspace's list, so the active one is the right context to tile in.
@@ -760,7 +768,7 @@ export class WindowHandler {
 
         const mru = this.windowingManager.getMRUOrder(workspace);
         const miniatureWindows = orderWindowsByMru(
-            remainingWindows.filter(w => WindowState.get(w, IS_MINIATURE)),
+            remainingWindows.filter(w => ShellState.get(w, IS_MINIATURE)),
             mru
         );
 
@@ -777,7 +785,7 @@ export class WindowHandler {
                 continue;
             }
 
-            this._ext._miniatureCascadeIds?.delete(candidate.get_id());
+            this._ext.forgetMiniatureCascade(candidate);
             this._ext.miniatureManager.restoreMiniature(candidate, null, {activate: false});
             // 'miniature-restored' fires synchronously; its handler has already run.
             return true;
@@ -813,7 +821,7 @@ export class WindowHandler {
         const miniatureWindows = orderWindowsByMru(
             workspace
                 .list_windows()
-                .filter(w => isWindowAlive(w) && WindowState.get(w, IS_MINIATURE)),
+                .filter(w => isWindowAlive(w) && ShellState.get(w, IS_MINIATURE)),
             this.windowingManager.getMRUOrder(workspace)
         );
 
@@ -838,7 +846,7 @@ export class WindowHandler {
             Logger.log(
                 `[REBALANCE] Restoring miniature ${candidate.get_id()} on monitor ${preferredMonitor}`
             );
-            this._ext._miniatureCascadeIds?.delete(candidate.get_id());
+            this._ext.forgetMiniatureCascade(candidate);
             this._ext.miniatureManager.restoreMiniature(candidate, null, {activate: false});
             return true;
         }
@@ -893,11 +901,11 @@ export class WindowHandler {
     // Decide membership first, then perform one final layout per affected monitor;
     // otherwise the local close tile visibly runs before the monitor move tile.
     _finalizeClosedWindow(removedWindow, workspace, monitor, freedWidth, freedHeight) {
-        const clearCloseState = () => WindowState.remove(removedWindow, 'closeFinalizationPending');
+        const clearCloseState = () => ShellState.remove(removedWindow, 'closeFinalizationPending');
 
         // If the generic removal timeout won an unusual signal-order race, the
         // coordinated final pass must still run against post-rebalance membership.
-        WindowState.remove(removedWindow, 'closeRetileHandledAt');
+        ShellState.remove(removedWindow, 'closeRetileHandledAt');
 
         if (!isWorkspaceAlive(workspace)) {
             clearCloseState();
@@ -924,7 +932,7 @@ export class WindowHandler {
 
         const clearMoveFlags = () => {
             for (const movedWindow of movedWindows)
-                WindowState.remove(movedWindow, 'monitorRebalanceInProgress');
+                ShellState.remove(movedWindow, 'monitorRebalanceInProgress');
             clearCloseState();
             return GLib.SOURCE_REMOVE;
         };
@@ -1044,18 +1052,18 @@ export class WindowHandler {
             settleTimeoutName = 'windowHandler_closeRetileSettle',
         } = options;
 
-        if (WindowState.get(removedWindow, 'closeRetileHandledAt')) {
+        if (ShellState.get(removedWindow, 'closeRetileHandledAt')) {
             Logger.log(
                 `_retileAfterWindowGone: already handled for ${removedWindow.get_id()} - skipping duplicate`
             );
             return {settleDelay: 0};
         }
-        if (!wasMovedByOverflow) WindowState.set(removedWindow, 'closeRetileHandledAt', true);
+        if (!wasMovedByOverflow) ShellState.set(removedWindow, 'closeRetileHandledAt', true);
 
         if (cleanSmartResizingFlags) {
             Logger.log('[SMART RESIZE] Cleaning up transient flags for remaining windows');
             for (const w of remainingWindows) {
-                WindowState.set(w, 'isSmartResizing', false);
+                ShellState.set(w, 'isSmartResizing', false);
             }
         }
 
@@ -1068,7 +1076,7 @@ export class WindowHandler {
             };
         }
 
-        const restorableWindows = remainingWindows.filter(w => !WindowState.get(w, IS_MINIATURE));
+        const restorableWindows = remainingWindows.filter(w => !ShellState.get(w, IS_MINIATURE));
 
         // When the caller doesn't trust its freedWidth/freedHeight, gating the
         // attempt on those values is pointless; e.g. 'unmanaged' can fire after
@@ -1081,8 +1089,8 @@ export class WindowHandler {
         let shouldTryRestore = hasFreedSpace && restorableWindows.length > 0;
         if (shouldTryRestore && requireConstrainedCheck) {
             shouldTryRestore = restorableWindows.some(w => {
-                const hasTarget = WindowState.get(w, 'targetSmartResizeSize') !== null;
-                const isConstrained = WindowState.get(w, 'isConstrainedByMosaic') === true;
+                const hasTarget = ShellState.get(w, 'targetSmartResizeSize') !== null;
+                const isConstrained = ShellState.get(w, 'isConstrainedByMosaic') === true;
                 return hasTarget || isConstrained;
             });
         }
@@ -1103,18 +1111,18 @@ export class WindowHandler {
             // move_resize_frame above hasn't settled yet; retiling now would read
             // get_frame_rect() before the client acks the new size, hit the layout
             // cache with the stale dimensions, and redraw right back over the restore.
-            this._ext._timeoutRegistry.add(
+            this._ext.timeoutRegistry.add(
                 constants.RESIZE_SETTLE_DELAY_MS,
                 () => {
                     if (settleLogLabel) Logger.log(settleLogLabel);
                     for (const w of restorableWindows) {
-                        WindowState.remove(w, 'isReverseSmartResizing');
+                        ShellState.remove(w, 'isReverseSmartResizing');
                     }
                     this.animationsManager.setMembershipChangeBounce(true);
                     this._ext.tilingManager.tileWorkspaceWindows(workspace, null, monitor, true);
                     this.animationsManager.setMembershipChangeBounce(false);
                     for (const w of restorableWindows) {
-                        WindowState.remove(w, 'targetRestoredSize');
+                        ShellState.remove(w, 'targetRestoredSize');
                     }
                     return GLib.SOURCE_REMOVE;
                 },
@@ -1135,23 +1143,23 @@ export class WindowHandler {
         const monitor = window.get_monitor();
         const windowId = window.get_id();
         const windowWorkspace = window.get_workspace();
-        WindowState.set(window, 'closeFinalizationPending', true);
+        ShellState.set(window, 'closeFinalizationPending', true);
 
         Logger.log(`onWindowDestroyed: ${windowId}`);
 
         this.disconnectWindowSignals(window);
 
-        if (this._ext.miniatureManager && WindowState.get(window, IS_MINIATURE)) {
+        if (this._ext.miniatureManager && ShellState.get(window, IS_MINIATURE)) {
             this._ext.miniatureManager.destroyMiniature(window);
         }
 
         this.edgeTilingManager.clearWindowState(window);
 
-        WindowState.remove(window, 'maximizedUndoInfo');
+        ShellState.remove(window, 'maximizedUndoInfo');
 
         if (this.windowingManager.isExcluded(window)) {
             Logger.log('Excluded window closed - no mosaic retile needed');
-            WindowState.remove(window, 'closeFinalizationPending');
+            ShellState.remove(window, 'closeFinalizationPending');
             return;
         }
 
@@ -1179,12 +1187,12 @@ export class WindowHandler {
                             freedHeight
                         );
                     },
-                    this._ext._timeoutRegistry,
+                    this._ext.timeoutRegistry,
                     constants.ANIMATION_DURATION_MS + constants.RESIZE_SETTLE_DELAY_MS
                 );
-            }, this._ext._timeoutRegistry);
+            }, this._ext.timeoutRegistry);
         } else {
-            WindowState.remove(window, 'closeFinalizationPending');
+            ShellState.remove(window, 'closeFinalizationPending');
         }
     }
 
@@ -1192,17 +1200,17 @@ export class WindowHandler {
         const windowId = window.get_id();
         // A (re)considered window voids any earlier close-retile dedup claim; cleared
         // before the dedupe returns below so a skipped re-enqueue still resets it.
-        WindowState.remove(window, 'closeRetileHandledAt');
+        ShellState.remove(window, 'closeRetileHandledAt');
         if (this._evaluationQueue.some(entry => entry.window.get_id() === windowId)) {
             Logger.log(`Skipping duplicate enqueue for window ${windowId}`);
             return;
         }
         // window-created and window-added both land here for a new window, so
         // skip if we just evaluated it.
-        const lastEvaluatedAt = WindowState.get(window, 'lastEvaluatedAt');
+        const lastEvaluatedAt = ShellState.get(window, 'lastEvaluatedAt');
         if (
             lastEvaluatedAt &&
-            !WindowState.get(window, 'userMoveOrigin') &&
+            !ShellState.get(window, 'userMoveOrigin') &&
             monotonicNow() - lastEvaluatedAt < constants.DUPLICATE_EVALUATION_WINDOW_MS
         ) {
             Logger.log(
@@ -1211,13 +1219,13 @@ export class WindowHandler {
             return;
         }
         Logger.log(`Enqueueing window ${windowId} for evaluation`);
-        WindowState.set(window, 'pendingInQueue', true);
+        ShellState.set(window, 'pendingInQueue', true);
         this._evaluationQueue.push({window, workspace, monitor});
         if (!this._isEvaluatingQueue) {
             this._processEvaluationQueue().catch(e => {
                 Logger.error(`Evaluation queue failed: ${e}\n${e.stack}`);
                 for (const entry of this._evaluationQueue)
-                    WindowState.remove(entry.window, 'pendingInQueue');
+                    ShellState.remove(entry.window, 'pendingInQueue');
                 this._evaluationQueue = [];
                 this._isEvaluatingQueue = false;
             });
@@ -1238,18 +1246,17 @@ export class WindowHandler {
 
         while (this._evaluationQueue.length > 0) {
             let {window, workspace, monitor} = this._evaluationQueue.shift();
-            WindowState.remove(window, 'pendingInQueue');
-            WindowState.set(window, 'lastEvaluatedAt', monotonicNow());
+            ShellState.remove(window, 'pendingInQueue');
+            ShellState.set(window, 'lastEvaluatedAt', monotonicNow());
 
             if (!isWindowAlive(window)) {
                 Logger.log('Evaluation queue: window destroyed before evaluation, skipping');
                 continue;
             }
-
             // An Overview drop belongs to the workspace the user chose, even
             // though another workspace remains active behind the Overview.
-            const arrivedFromDnD = WindowState.get(window, 'arrivedFromDnD') === true;
-            WindowState.remove(window, 'arrivedFromDnD');
+            const arrivedFromDnD = ShellState.get(window, 'arrivedFromDnD') === true;
+            ShellState.remove(window, 'arrivedFromDnD');
 
             // Guard against invalid workspace (can occur if workspace was removed during async smart resize)
             if (workspace.index() < 0) {
@@ -1263,7 +1270,7 @@ export class WindowHandler {
                     Logger.log(
                         `Evaluation queue: window ${window.get_id()} has invalid workspace, skipping`
                     );
-                    WindowState.remove(window, 'arrivalPending');
+                    ShellState.remove(window, 'arrivalPending');
                     continue;
                 }
             }
@@ -1300,7 +1307,7 @@ export class WindowHandler {
                     workspace = lastOverflowWorkspace;
 
                     if (window.get_workspace() !== workspace) {
-                        WindowState.set(window, 'movedByOverflow', true);
+                        ShellState.set(window, 'movedByOverflow', true);
                         window.change_workspace(workspace);
                     }
                 }
@@ -1329,7 +1336,7 @@ export class WindowHandler {
             }
 
             // Placement resolved either way, so the arrival shield no longer applies
-            WindowState.remove(window, 'arrivalPending');
+            ShellState.remove(window, 'arrivalPending');
 
             // Small delay to let animations/mutter settle before evaluating the next window
             await new Promise(resolve => {
@@ -1359,7 +1366,7 @@ export class WindowHandler {
             monitor = currentMonitor;
         }
 
-        const pendingMonitorTarget = WindowState.get(window, 'monitorPlacementTarget');
+        const pendingMonitorTarget = ShellState.get(window, 'monitorPlacementTarget');
         if (pendingMonitorTarget !== undefined) {
             Logger.log(
                 `ensureWindowFits: Window ${window.get_id()} is already moving to monitor ${pendingMonitorTarget}`
@@ -1367,12 +1374,12 @@ export class WindowHandler {
             return workspace;
         }
 
-        if (WindowState.get(window, 'isSmartResizing')) {
+        if (ShellState.get(window, 'isSmartResizing')) {
             Logger.log('ensureWindowFits: Skipping - smart resize in progress');
             return workspace;
         }
 
-        if (WindowState.get(window, 'restoringFromMiniature')) {
+        if (ShellState.get(window, 'restoringFromMiniature')) {
             Logger.log(
                 `ensureWindowFits: Skipping - restoring from miniature for ${window.get_id()}`
             );
@@ -1389,10 +1396,10 @@ export class WindowHandler {
         );
         const workspaceWindows = this.windowingManager
             .getMonitorWorkspaceWindows(workspace, monitor)
-            .filter(w => !WindowState.get(w, 'pendingInQueue'));
+            .filter(w => !ShellState.get(w, 'pendingInQueue'));
         const otherWindows = workspaceWindows.filter(w => w.get_id() !== window.get_id());
 
-        const userMoveOrigin = WindowState.get(window, 'userMoveOrigin');
+        const userMoveOrigin = ShellState.get(window, 'userMoveOrigin');
         if (userMoveOrigin && hasExistingSacred) {
             try {
                 if (
@@ -1406,10 +1413,10 @@ export class WindowHandler {
                     return workspace;
                 }
             } finally {
-                WindowState.remove(window, 'userMoveOrigin');
+                ShellState.remove(window, 'userMoveOrigin');
             }
         } else if (userMoveOrigin) {
-            WindowState.remove(window, 'userMoveOrigin');
+            ShellState.remove(window, 'userMoveOrigin');
         }
 
         if (hasExistingSacred || (isIncomingSacred && otherWindows.length > 0)) {
@@ -1428,6 +1435,37 @@ export class WindowHandler {
                 return workspace;
             }
 
+            // A normal window may have spawned on the monitor owned by a sacred
+            // window while another monitor is occupied by an ordinary mosaic.
+            // Natural-size placement failed above, but that destination must still
+            // receive the usual resize/miniature attempt before workspace overflow.
+            if (!isIncomingSacred && hasExistingSacred) {
+                const resizeMonitor = this.windowingManager.findMonitorForResizeAttempt(
+                    window,
+                    workspace,
+                    monitor
+                );
+                if (resizeMonitor !== null) {
+                    Logger.log(
+                        `[PLACEMENT] Moving normal window ${window.get_id()} from sacred monitor ${monitor} to monitor ${resizeMonitor} for smart-resize evaluation`
+                    );
+                    const moved = await this._moveWindowToMonitorAndWait(
+                        window,
+                        workspace,
+                        monitor,
+                        resizeMonitor,
+                        {deferDestinationTiling: true}
+                    );
+                    if (moved)
+                        return await this._ensureWindowFits(
+                            window,
+                            workspace,
+                            resizeMonitor,
+                            arrivedFromDnD
+                        );
+                }
+            }
+
             Logger.log(
                 `Sacred Isolation triggered (IncomingSacred: ${isIncomingSacred}, HasExistingSacred: ${hasExistingSacred}) - isolating`
             );
@@ -1435,7 +1473,7 @@ export class WindowHandler {
         }
 
         // Already constrained, so sibling frames may not have settled yet; tile directly to avoid false overflow.
-        if (WindowState.get(window, 'isConstrainedByMosaic')) {
+        if (ShellState.get(window, 'isConstrainedByMosaic')) {
             Logger.log(
                 `ensureWindowFits: Window ${window.get_id()} already constrained by mosaic - tiling directly`
             );
@@ -1486,7 +1524,7 @@ export class WindowHandler {
                             constants.RESIZE_SETTLE_DELAY_MS,
                             () => {
                                 for (const w of monitorWindows) {
-                                    WindowState.remove(w, 'isReverseSmartResizing');
+                                    ShellState.remove(w, 'isReverseSmartResizing');
                                 }
                                 return GLib.SOURCE_REMOVE;
                             },
@@ -1498,7 +1536,7 @@ export class WindowHandler {
         }
 
         // Use TARGET size for restoration flows to avoid transient overflow ejection.
-        const targetSize = WindowState.get(window, 'targetRestoredSize');
+        const targetSize = ShellState.get(window, 'targetRestoredSize');
         const canFit = this.tilingManager.canFitWindow(
             window,
             workspace,
@@ -1541,7 +1579,7 @@ export class WindowHandler {
                 w =>
                     w.get_id() !== window.get_id() &&
                     !this.edgeTilingManager.isEdgeTiled(w) &&
-                    !WindowState.get(w, 'pendingInQueue')
+                    !ShellState.get(w, 'pendingInQueue')
             );
 
         // Include IS_MINIATURE windows so tryFitWithResize can account for the space they occupy.
@@ -1564,19 +1602,16 @@ export class WindowHandler {
             if (resizeResult?.success) {
                 Logger.log('Smart resize applied, tiling directly');
                 // Block overflow during tiling, since a null reference would otherwise let it expel something
-                this.tilingManager._isSmartResizingBlocked = true;
-                try {
-                    this.tilingManager._pendingMiniatureWindows = resizeResult.pendingWindows ?? [];
-                    this.tilingManager.tileWorkspaceWindows(workspace, null, monitor, false);
-                } finally {
-                    this.tilingManager._isSmartResizingBlocked = false;
-                }
+                this.tilingManager.runSmartResizeTile(workspace, {
+                    monitor,
+                    pendingWindows: resizeResult.pendingWindows,
+                });
                 return workspace;
             }
         }
 
         Logger.log(
-            `Smart resize failed or skipped - applying Overflow logic (existingWindows=${existingWindows.length}, blocked=${this.tilingManager._isSmartResizingBlocked})`
+            `Smart resize failed or skipped - applying Overflow logic (existingWindows=${existingWindows.length}, blocked=${this.tilingManager.isSmartResizingBlocked})`
         );
         return await this.windowingManager.moveOversizedWindow(window);
     }
@@ -1600,7 +1635,7 @@ export class WindowHandler {
     // from the current siblings alone (e.g. a fully packed grid with no free edge),
     // which would only catch that one shape of enclosure, not every possible one.
     _hasSiblings(window) {
-        const cached = WindowState.get(window, 'hasEntranceSiblings');
+        const cached = ShellState.get(window, 'hasEntranceSiblings');
         if (cached !== undefined) return cached;
 
         const workspace = window.get_workspace();
@@ -1610,7 +1645,7 @@ export class WindowHandler {
         const result = this.windowingManager
             .getMonitorWorkspaceWindows(workspace, monitor)
             .some(w => w.get_id() !== window.get_id());
-        WindowState.set(window, 'hasEntranceSiblings', result);
+        ShellState.set(window, 'hasEntranceSiblings', result);
         return result;
     }
 
@@ -1622,7 +1657,7 @@ export class WindowHandler {
         const bornSacred = this.windowingManager.isMaximizedOrFullscreen(window);
         // Distinguishes a later user maximize from the pre-creation size-change
         // signal emitted by clients that map already maximized/fullscreen.
-        WindowState.set(window, 'creationObserved', true);
+        ShellState.set(window, 'creationObserved', true);
 
         // Shift held at launch: make always-on-top before any tiling runs
         const [, , creationMods] = global.get_pointer();
@@ -1632,10 +1667,10 @@ export class WindowHandler {
         }
 
         if (bornSacred) {
-            WindowState.set(window, 'openedMaximized', true);
+            ShellState.set(window, 'openedMaximized', true);
             // Defense: clean up flags that onSizeChange may have set before window-created fired
-            WindowState.remove(window, 'maximizedUndoInfo');
-            WindowState.remove(window, 'isEnteringSacred');
+            ShellState.remove(window, 'maximizedUndoInfo');
+            ShellState.remove(window, 'isEnteringSacred');
             Logger.log(`Window ${window.get_id()} opened maximized - marked for auto-tile check`);
         }
 
@@ -1652,7 +1687,7 @@ export class WindowHandler {
             ) {
                 if (this.windowingManager.isExcluded(window)) {
                     Logger.log('Window excluded from tiling');
-                    WindowState.remove(window, 'arrivalPending');
+                    ShellState.remove(window, 'arrivalPending');
                     this.revealPendingEntrance(window);
                     this._revealPendingMonitorPlacementEntrance(window);
                     return GLib.SOURCE_REMOVE;
@@ -1660,8 +1695,8 @@ export class WindowHandler {
 
                 const sacredNow = this.windowingManager.isMaximizedOrFullscreen(window);
                 const normalPlacementCompleted =
-                    WindowState.get(window, 'lastEvaluatedAt') !== undefined &&
-                    !WindowState.get(window, 'arrivalPending');
+                    ShellState.get(window, 'lastEvaluatedAt') !== undefined &&
+                    !ShellState.get(window, 'arrivalPending');
                 // Preserve the mapped-late fallback for clients whose born-fullscreen
                 // state was not visible at window-created time. Once the normal arrival
                 // has completed, however, sacred state is a later user transition.
@@ -1685,7 +1720,7 @@ export class WindowHandler {
                             window.saved_rect ||
                             (window.get_saved_rect ? window.get_saved_rect() : null);
                         if (saved && saved.width > 0 && saved.height > 0) {
-                            WindowState.set(window, 'openingSize', {
+                            ShellState.set(window, 'openingSize', {
                                 width: saved.width,
                                 height: saved.height,
                             });
@@ -1699,7 +1734,7 @@ export class WindowHandler {
                             if (workArea) {
                                 const fallbackWidth = Math.floor(workArea.width * 0.8);
                                 const fallbackHeight = Math.floor(workArea.height * 0.8);
-                                WindowState.set(window, 'openingSize', {
+                                ShellState.set(window, 'openingSize', {
                                     width: fallbackWidth,
                                     height: fallbackHeight,
                                 });
@@ -1721,14 +1756,14 @@ export class WindowHandler {
                     // Some fullscreen clients omit size-change and only expose
                     // sacred state once mapped. This is still their creation path,
                     // so treat them as born sacred before any monitor move.
-                    WindowState.set(window, 'openedMaximized', true);
-                    const pendingMonitorTarget = WindowState.get(window, 'monitorPlacementTarget');
+                    ShellState.set(window, 'openedMaximized', true);
+                    const pendingMonitorTarget = ShellState.get(window, 'monitorPlacementTarget');
                     if (pendingMonitorTarget !== undefined) {
                         Logger.log(
                             `Opened sacred window ${window.get_id()} already has pre-map target monitor ${pendingMonitorTarget}`
                         );
-                        WindowState.remove(window, 'arrivalPending');
-                        WindowState.set(window, 'lastEvaluatedAt', monotonicNow());
+                        ShellState.remove(window, 'arrivalPending');
+                        ShellState.set(window, 'lastEvaluatedAt', monotonicNow());
                         return GLib.SOURCE_REMOVE;
                     }
 
@@ -1752,8 +1787,8 @@ export class WindowHandler {
                             Logger.log(
                                 'Opened sacred (Max/Full) on occupied monitor - using empty monitor in current workspace'
                             );
-                            WindowState.remove(window, 'arrivalPending');
-                            WindowState.set(window, 'lastEvaluatedAt', monotonicNow());
+                            ShellState.remove(window, 'arrivalPending');
+                            ShellState.set(window, 'lastEvaluatedAt', monotonicNow());
                             const moved = this.windowingManager.moveWindowToMonitor(
                                 window,
                                 workspace,
@@ -1772,7 +1807,7 @@ export class WindowHandler {
                         return GLib.SOURCE_REMOVE;
                     } else {
                         Logger.log('Sacred window in empty workspace - keeping here');
-                        WindowState.remove(window, 'arrivalPending');
+                        ShellState.remove(window, 'arrivalPending');
                         this._revealPendingMonitorPlacementEntrance(window);
                         this.tilingManager.tileWorkspaceWindows(workspace, window, monitor, false);
                         return GLib.SOURCE_REMOVE;
@@ -1802,7 +1837,7 @@ export class WindowHandler {
 
                     if (tileSuccess) {
                         Logger.log('New window: Successfully tiled with edge-tiled window');
-                        WindowState.remove(window, 'arrivalPending');
+                        ShellState.remove(window, 'arrivalPending');
                         this.connectWindowSignals(window);
                         return GLib.SOURCE_REMOVE;
                     }
@@ -1824,7 +1859,7 @@ export class WindowHandler {
         const actor = window.get_compositor_private();
         if (actor) {
             const isRelated = this.windowingManager.isRelated(window);
-            const pendingMonitorTarget = WindowState.get(window, 'monitorPlacementTarget');
+            const pendingMonitorTarget = ShellState.get(window, 'monitorPlacementTarget');
             const openingMonitorTarget =
                 pendingMonitorTarget ??
                 (isRelated ? this._findBornSacredMonitorTarget(window) : null);
@@ -1832,7 +1867,7 @@ export class WindowHandler {
                 // Sacred windows normally retain Mutter's native effect because
                 // Mosaic never tiles them. This one is about to cross monitors,
                 // though, so keep it hidden until the destination frame settles.
-                WindowState.set(window, 'monitorPlacementEntrancePending', true);
+                ShellState.set(window, 'monitorPlacementEntrancePending', true);
                 Main.wm.skipNextEffect(actor);
                 actor.opacity = 0;
                 // Reassert after Shell's own map handlers have run. skipNextEffect
@@ -1841,7 +1876,7 @@ export class WindowHandler {
                     const mappedSignalId = actor.connect('notify::mapped', () => {
                         if (!actor.mapped) return;
                         actor.disconnect(mappedSignalId);
-                        if (WindowState.get(window, 'monitorPlacementTarget') !== undefined) {
+                        if (ShellState.get(window, 'monitorPlacementTarget') !== undefined) {
                             actor.remove_transition('opacity');
                             actor.opacity = 0;
                         }
@@ -1865,8 +1900,8 @@ export class WindowHandler {
                     constants.SLIDE_IN_FAILSAFE_MS,
                     () => {
                         if (
-                            WindowState.get(window, 'monitorPlacementEntrancePending') &&
-                            WindowState.get(window, 'monitorPlacementTarget') === undefined
+                            ShellState.get(window, 'monitorPlacementEntrancePending') &&
+                            ShellState.get(window, 'monitorPlacementTarget') === undefined
                         )
                             this._revealPendingMonitorPlacementEntrance(window);
                         return GLib.SOURCE_REMOVE;
@@ -1967,7 +2002,7 @@ export class WindowHandler {
 
     onWindowAdded(_workspace, window) {
         this.windowingManager.invalidateWindowsCache();
-        if (WindowState.get(window, 'userPlacementDisplaced')) {
+        if (ShellState.get(window, 'userPlacementDisplaced')) {
             // makeRoomForUserPlacement owns both sides of this internal move.
             return;
         }
@@ -1987,8 +2022,8 @@ export class WindowHandler {
 
         // addedTime feeds resize settling and rebalance age checks; arrivalPending
         // shields the window until its arrival evaluation resolves placement.
-        WindowState.set(window, 'addedTime', monotonicNow());
-        WindowState.set(window, 'arrivalPending', true);
+        ShellState.set(window, 'addedTime', monotonicNow());
+        ShellState.set(window, 'arrivalPending', true);
 
         // Flag the first-ever tiling pass for this window so it slides in instead
         // of using the "no jump" continuity math meant for windows that already
@@ -1996,7 +2031,7 @@ export class WindowHandler {
         // skip its own open animation (skipNextEffect) and nudges animateWindow's
         // deferred entrance once the actor is actually mapped.
         if (!this.shouldSkipSlideIn(window)) {
-            WindowState.set(window, 'pendingFirstPlacement', true);
+            ShellState.set(window, 'pendingFirstPlacement', true);
             const actor = window.get_compositor_private();
             // onWindowCreated races independently and may have already started (or
             // queued) the real entrance ease by the time this runs. Resetting opacity
@@ -2016,13 +2051,13 @@ export class WindowHandler {
                 this._timeoutRegistry.add(
                     constants.SLIDE_IN_FAILSAFE_MS,
                     () => {
-                        if (!WindowState.get(window, 'pendingFirstPlacement'))
+                        if (!ShellState.get(window, 'pendingFirstPlacement'))
                             return GLib.SOURCE_REMOVE;
                         if (this._ext.animationsManager.hasActiveOrPendingEntrance(window)) {
                             scheduleFirstPlacementFailsafe();
                             return GLib.SOURCE_REMOVE;
                         }
-                        WindowState.remove(window, 'pendingFirstPlacement');
+                        ShellState.remove(window, 'pendingFirstPlacement');
                         const a = isWindowAlive(window) ? window.get_compositor_private() : null;
                         if (a && !a.is_destroyed()) a.opacity = 255;
                         return GLib.SOURCE_REMOVE;
@@ -2048,8 +2083,8 @@ export class WindowHandler {
 
             // Detect a DnD across workspaces: window was just removed from a different
             // workspace within SAFETY_TIMEOUT_BUFFER_MS, so this add is the drop side.
-            const previousWorkspaceIndex = WindowState.get(WINDOW, 'previousWorkspace');
-            const removedTimestamp = WindowState.get(WINDOW, 'removedTimestamp');
+            const previousWorkspaceIndex = ShellState.get(WINDOW, 'previousWorkspace');
+            const removedTimestamp = ShellState.get(WINDOW, 'removedTimestamp');
             const timeSinceRemoved = removedTimestamp
                 ? monotonicNow() - removedTimestamp
                 : Infinity;
@@ -2060,13 +2095,13 @@ export class WindowHandler {
                 timeSinceRemoved < constants.SAFETY_TIMEOUT_BUFFER_MS
             ) {
                 // Skip if this is an overflow move, not a real drag-drop
-                if (!WindowState.get(WINDOW, 'movedByOverflow')) {
+                if (!ShellState.get(WINDOW, 'movedByOverflow')) {
                     const originWorkspace =
                         global.workspace_manager.get_workspace_by_index(previousWorkspaceIndex);
                     if (originWorkspace) {
-                        WindowState.set(WINDOW, 'userMoveOrigin', {
+                        ShellState.set(WINDOW, 'userMoveOrigin', {
                             workspace: originWorkspace,
-                            monitor: WindowState.get(WINDOW, 'leftMonitor') ?? MONITOR,
+                            monitor: ShellState.get(WINDOW, 'leftMonitor') ?? MONITOR,
                         });
                     }
                     // An Overview drop must not activate its destination or close
@@ -2077,15 +2112,15 @@ export class WindowHandler {
                     }
 
                     // Mark as DnD arrival; triggers expansion after tiling
-                    WindowState.set(WINDOW, 'arrivedFromDnD', true);
+                    ShellState.set(WINDOW, 'arrivedFromDnD', true);
 
-                    WindowState.remove(WINDOW, 'previousWorkspace');
-                    WindowState.remove(WINDOW, 'removedTimestamp');
+                    ShellState.remove(WINDOW, 'previousWorkspace');
+                    ShellState.remove(WINDOW, 'removedTimestamp');
                 }
             }
 
             // Mark window as waiting for geometry; prevents premature overflow
-            WindowState.set(WINDOW, 'waitingForGeometry', true);
+            ShellState.set(WINDOW, 'waitingForGeometry', true);
 
             // Repoll while waitForGeometry returns SOURCE_CONTINUE, bounded
             // so a window that never reports geometry can't poll forever.
@@ -2099,7 +2134,7 @@ export class WindowHandler {
                     ) {
                         // Giving up here used to strand arrivalPending, and everything that
                         // reads it as "placement unresolved" would shield the window forever.
-                        WindowState.remove(WINDOW, 'arrivalPending');
+                        ShellState.remove(WINDOW, 'arrivalPending');
                         return GLib.SOURCE_REMOVE;
                     }
                     return this.waitForGeometry(WINDOW, WORKSPACE, MONITOR);
@@ -2121,8 +2156,9 @@ export class WindowHandler {
     onWindowRemoved(workspace, window) {
         this.windowingManager.invalidateWindowsCache();
         if (
-            WindowState.get(window, 'monitorRebalanceInProgress') ||
-            WindowState.get(window, 'userPlacementDisplaced')
+            ShellState.get(window, 'monitorRebalanceInProgress') ||
+            ShellState.get(window, 'userPlacementDisplaced') ||
+            ShellState.get(window, 'monitorPlacementTarget') !== undefined
         ) {
             return;
         }
@@ -2134,19 +2170,19 @@ export class WindowHandler {
         // 'window-removed' signal land here, so dedupe to keep the retile/restore
         // pipeline (and miniature auto-restore) from running twice.
         const now = monotonicNow();
-        const lastHandled = WindowState.get(window, 'removalHandledAt');
+        const lastHandled = ShellState.get(window, 'removalHandledAt');
         if (lastHandled && now - lastHandled < constants.SAFETY_TIMEOUT_BUFFER_MS) {
             Logger.log(
                 `onWindowRemoved: duplicate removal event for ${window.get_id()} - skipping`
             );
             return;
         }
-        WindowState.set(window, 'removalHandledAt', now);
+        ShellState.set(window, 'removalHandledAt', now);
 
-        WindowState.set(window, 'previousWorkspace', workspace.index());
-        WindowState.set(window, 'removedTimestamp', now);
+        ShellState.set(window, 'previousWorkspace', workspace.index());
+        ShellState.set(window, 'removedTimestamp', now);
 
-        const wasMovedByOverflow = WindowState.get(window, 'movedByOverflow');
+        const wasMovedByOverflow = ShellState.get(window, 'movedByOverflow');
 
         // Capture removed window's size before any operations. Guarded since the
         // window may already be disposed when removal comes from a destroy.
@@ -2170,12 +2206,12 @@ export class WindowHandler {
             // A window leaving for another monitor already reports the destination here,
             // which counts the siblings it left behind as zero and reads as an empty
             // workspace. onWindowLeftMonitor fires right after us with the real source.
-            const leftMonitorAt = WindowState.get(window, 'leftMonitorAt');
+            const leftMonitorAt = ShellState.get(window, 'leftMonitorAt');
             const cameFromMonitorMove =
                 leftMonitorAt &&
                 monotonicNow() - leftMonitorAt < constants.SAFETY_TIMEOUT_BUFFER_MS;
             const MONITOR = cameFromMonitorMove
-                ? WindowState.get(window, 'leftMonitor')
+                ? ShellState.get(window, 'leftMonitor')
                 : removedMonitor;
 
             if (!WORKSPACE || WORKSPACE.index() < 0) {
@@ -2198,7 +2234,7 @@ export class WindowHandler {
 
             // Actual closes are finalized after the close animation, together with
             // monitor redistribution. Workspace/DnD removals still use this path.
-            if (WindowState.get(window, 'closeFinalizationPending')) {
+            if (ShellState.get(window, 'closeFinalizationPending')) {
                 Logger.log('_windowRemoved: close transaction owns the final layout');
                 return GLib.SOURCE_REMOVE;
             }
@@ -2236,7 +2272,7 @@ export class WindowHandler {
                     Logger.log(
                         '_windowRemoved: No related windows remain on monitor; staying on current workspace'
                     );
-                    WindowState.remove(window, 'isRestoringSacred');
+                    ShellState.remove(window, 'isRestoringSacred');
                 }
             }
 
@@ -2248,24 +2284,24 @@ export class WindowHandler {
         const rect = WINDOW.get_frame_rect();
 
         if (rect.width > 0 && rect.height > 0) {
-            WindowState.set(WINDOW, 'waitingForGeometry', false);
-            WindowState.set(WINDOW, 'geometryReady', true);
+            ShellState.set(WINDOW, 'waitingForGeometry', false);
+            ShellState.set(WINDOW, 'geometryReady', true);
 
             if (this._ext.windowingManager.isExcluded(WINDOW)) {
                 Logger.log(
                     'waitForGeometry: Window is excluded - connecting signals but skipping tiling'
                 );
-                WindowState.remove(WINDOW, 'arrivalPending');
+                ShellState.remove(WINDOW, 'arrivalPending');
                 this.connectWindowSignals(WINDOW);
                 this.revealPendingEntrance(WINDOW);
                 return GLib.SOURCE_REMOVE;
             }
 
-            if (WindowState.get(WINDOW, 'monitorPlacementTarget') !== undefined) {
+            if (ShellState.get(WINDOW, 'monitorPlacementTarget') !== undefined) {
                 Logger.log(
                     `Window ${WINDOW.get_id()} geometry ready while pre-map monitor placement is pending`
                 );
-                WindowState.remove(WINDOW, 'arrivalPending');
+                ShellState.remove(WINDOW, 'arrivalPending');
                 return GLib.SOURCE_REMOVE;
             }
 
@@ -2274,12 +2310,12 @@ export class WindowHandler {
                 `Window ${WINDOW.get_id()} ready: size=${rect.width}x${rect.height}, workArea=${wa.width}x${wa.height}`
             );
 
-            if (WindowState.get(WINDOW, 'movedByOverflow')) {
+            if (ShellState.get(WINDOW, 'movedByOverflow')) {
                 Logger.log(
                     'Skipping early tile in waitForGeometry - window was moved by overflow (Flags cleared to prevent leakage)'
                 );
-                WindowState.remove(WINDOW, 'movedByOverflow');
-                WindowState.remove(WINDOW, 'arrivalPending');
+                ShellState.remove(WINDOW, 'movedByOverflow');
+                ShellState.remove(WINDOW, 'arrivalPending');
                 return GLib.SOURCE_REMOVE;
             }
 
@@ -2292,27 +2328,27 @@ export class WindowHandler {
             }
 
             const performTiling = async () => {
-                if (WindowState.get(WINDOW, 'movedByOverflow')) {
+                if (ShellState.get(WINDOW, 'movedByOverflow')) {
                     Logger.log(
                         'Skipping duplicate evaluation queueing - window was already evaluated and moved by overflow'
                     );
-                    WindowState.remove(WINDOW, 'arrivalPending');
+                    ShellState.remove(WINDOW, 'arrivalPending');
                     return;
                 }
                 this.enqueueWindowForEvaluation(WINDOW, WORKSPACE, MONITOR);
             };
 
-            const isDnDArrival = WindowState.get(WINDOW, 'arrivedFromDnD');
-            const previousWorkspaceIndex = WindowState.get(WINDOW, 'previousWorkspace');
+            const isDnDArrival = ShellState.get(WINDOW, 'arrivedFromDnD');
+            const previousWorkspaceIndex = ShellState.get(WINDOW, 'previousWorkspace');
 
             if (
                 isDnDArrival ||
-                WindowState.get(WINDOW, 'movedByOverflow') ||
+                ShellState.get(WINDOW, 'movedByOverflow') ||
                 (previousWorkspaceIndex !== undefined &&
                     previousWorkspaceIndex !== WORKSPACE.index())
             ) {
                 Logger.log('Cross-workspace move: Waiting for workspace animation');
-                afterWorkspaceSwitch(performTiling, this._ext._timeoutRegistry);
+                afterWorkspaceSwitch(performTiling, this._ext.timeoutRegistry);
             } else {
                 performTiling();
             }

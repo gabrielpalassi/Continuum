@@ -8,11 +8,11 @@ import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import * as Logger from './logger.js';
 import {afterWorkspaceSwitch, afterAnimations, monotonicNow} from './timing.js';
-import * as WindowState from './windowState.js';
+import * as ShellState from './shellState.js';
 import * as constants from './constants.js';
 import {TileZone} from './constants.js';
-import {isResizeGrabOp} from './grabOps.js';
-import {isWorkspaceAlive, isWindowAlive} from './liveness.js';
+import {isResizeGrabOp} from './grabHandler.js';
+import {isWorkspaceAlive, isWindowAlive} from './shellState.js';
 import {MosaicModel} from './mosaicModel.js';
 import {restoreBeforeRearrange} from './layoutPlanning.js';
 
@@ -41,20 +41,20 @@ export class ResizeHandler {
     get animationsManager() {
         return this._ext.animationsManager;
     }
-    get dragHandler() {
-        return this._ext.dragHandler;
+    get grabHandler() {
+        return this._ext.grabHandler;
     }
     get _timeoutRegistry() {
-        return this._ext._timeoutRegistry;
+        return this._ext.timeoutRegistry;
     }
     get _currentGrabOp() {
-        return this.dragHandler._currentGrabOp;
+        return this.grabHandler.currentGrabOp;
     }
     get _skipNextTiling() {
-        return this.dragHandler._skipNextTiling;
+        return this.grabHandler.skipNextTiling;
     }
     set _skipNextTiling(val) {
-        this.dragHandler._skipNextTiling = val;
+        this.grabHandler.skipNextTiling = val;
     }
 
     _queueConstraintRebalance(window) {
@@ -91,16 +91,16 @@ export class ResizeHandler {
         Logger.log(
             `[SMART RESIZE] Window ${window.get_id()} clamped: target=${pendingSmartSize.width}×${pendingSmartSize.height}, actual=${rect.width}×${rect.height}`
         );
-        WindowState.set(window, 'targetSmartResizeSize', {
+        ShellState.set(window, 'targetSmartResizeSize', {
             width: rect.width,
             height: rect.height,
         });
         // Only the axis that stayed above target really clamped; the other reached
         // target and shouldn't be pinned as a minimum.
         if (rect.width > pendingSmartSize.width + 2)
-            WindowState.set(window, 'actualMinWidth', rect.width);
+            ShellState.set(window, 'actualMinWidth', rect.width);
         if (rect.height > pendingSmartSize.height + 2)
-            WindowState.set(window, 'actualMinHeight', rect.height);
+            ShellState.set(window, 'actualMinHeight', rect.height);
         this._disarmClampVerification(window);
 
         // A window we just placed can clamp a few px against its own minimum.
@@ -124,10 +124,10 @@ export class ResizeHandler {
     _shouldDeferClampCommit(window) {
         // The frame settles relative to when the target was applied, not when the window was born;
         // an old window handed a fresh target is still mid-shrink, not clamping.
-        const setAt = WindowState.get(window, 'targetSmartResizeSetAt');
+        const setAt = ShellState.get(window, 'targetSmartResizeSetAt');
         if (setAt !== undefined && monotonicNow() - setAt < constants.RESIZE_CLAMP_SETTLE_WINDOW_MS)
             return true;
-        const addedTime = WindowState.get(window, 'addedTime');
+        const addedTime = ShellState.get(window, 'addedTime');
         if (addedTime === undefined) return false;
         return monotonicNow() - addedTime < constants.RESIZE_CLAMP_SETTLE_WINDOW_MS;
     }
@@ -140,11 +140,11 @@ export class ResizeHandler {
         const verifyId = this._timeoutRegistry.add(
             constants.RESIZE_CLAMP_VERIFY_DELAY_MS,
             () => {
-                WindowState.remove(window, 'clampVerifyId');
+                ShellState.remove(window, 'clampVerifyId');
                 if (!isWindowAlive(window)) return GLib.SOURCE_REMOVE;
 
                 // Whatever resolved or replaced this target meanwhile owns the state now.
-                const current = WindowState.get(window, 'targetSmartResizeSize');
+                const current = ShellState.get(window, 'targetSmartResizeSize');
                 if (
                     !current ||
                     current.width !== pendingSmartSize.width ||
@@ -162,20 +162,20 @@ export class ResizeHandler {
                     );
                     this._commitClampedSize(window, pendingSmartSize, rect);
                 } else {
-                    WindowState.set(window, 'targetSmartResizeSize', null);
+                    ShellState.set(window, 'targetSmartResizeSize', null);
                 }
                 return GLib.SOURCE_REMOVE;
             },
             'resizeHandler_clampVerify'
         );
-        WindowState.set(window, 'clampVerifyId', verifyId);
+        ShellState.set(window, 'clampVerifyId', verifyId);
     }
 
     _disarmClampVerification(window) {
-        const verifyId = WindowState.get(window, 'clampVerifyId');
+        const verifyId = ShellState.get(window, 'clampVerifyId');
         if (verifyId === undefined) return;
         this._timeoutRegistry.remove(verifyId);
-        WindowState.remove(window, 'clampVerifyId');
+        ShellState.remove(window, 'clampVerifyId');
     }
 
     onResizeBegin(window, grabpo) {
@@ -184,13 +184,13 @@ export class ResizeHandler {
         this.animationsManager.setResizingWindow(window.get_id());
 
         // Always clear pending resize targets so manual resize takes precedence
-        WindowState.set(window, 'targetSmartResizeSize', null);
-        WindowState.remove(window, 'targetRestoredSize');
-        if (WindowState.get(window, 'isSmartResizing')) {
+        ShellState.set(window, 'targetSmartResizeSize', null);
+        ShellState.remove(window, 'targetRestoredSize');
+        if (ShellState.get(window, 'isSmartResizing')) {
             Logger.log(
                 `Manual resize started for ${window.get_id()} - clearing smart-resize state`
             );
-            WindowState.set(window, 'isSmartResizing', false);
+            ShellState.set(window, 'isSmartResizing', false);
         }
 
         Logger.log(`Tracking resize for window ${window.get_id()}, grabpo=${grabpo}`);
@@ -302,12 +302,12 @@ export class ResizeHandler {
         // Detect born-maximized: size-change fires BEFORE window-created for new windows.
         // A window with no preferredSize/openingSize hasn't been through onWindowCreated yet.
         if (
-            !WindowState.get(window, 'creationObserved') &&
-            !WindowState.get(window, 'preferredSize') &&
-            !WindowState.get(window, 'openingSize') &&
+            !ShellState.get(window, 'creationObserved') &&
+            !ShellState.get(window, 'preferredSize') &&
+            !ShellState.get(window, 'openingSize') &&
             this.windowingManager.isMaximizedOrFullscreen(window)
         ) {
-            WindowState.set(window, 'openedMaximized', true);
+            ShellState.set(window, 'openedMaximized', true);
             Logger.log(
                 `tryEnterSacred: Detected born-maximized window ${window.get_id()} - attempting pre-map monitor placement`
             );
@@ -318,7 +318,7 @@ export class ResizeHandler {
                 workspace &&
                 monitor !== null &&
                 monitor >= 0 &&
-                WindowState.get(window, 'monitorPlacementTarget') === undefined
+                ShellState.get(window, 'monitorPlacementTarget') === undefined
             ) {
                 this.windowingManager.invalidateWindowsCache();
                 const hasSourceSiblings = this.windowingManager
@@ -346,10 +346,10 @@ export class ResizeHandler {
             return;
         }
         // Born-maximized guard (from onWindowCreated, for subsequent maximize events)
-        if (WindowState.get(window, 'openedMaximized')) {
+        if (ShellState.get(window, 'openedMaximized')) {
             return;
         }
-        if (WindowState.get(window, 'sacredEnterPending')) {
+        if (ShellState.get(window, 'sacredEnterPending')) {
             return;
         }
 
@@ -357,7 +357,7 @@ export class ResizeHandler {
         const monitor = window.get_monitor();
 
         // LOCK: Set flag to block onSizeChanged from saving giant dimensions
-        WindowState.set(window, 'isEnteringSacred', true);
+        ShellState.set(window, 'isEnteringSacred', true);
 
         if (
             !this.windowingManager.isMaximizedOrFullscreen(window) ||
@@ -369,7 +369,7 @@ export class ResizeHandler {
         Logger.log(
             '[SACRED-ENTER] User entering sacred state - debouncing before evacuating siblings'
         );
-        WindowState.set(window, 'sacredEnterPending', true);
+        ShellState.set(window, 'sacredEnterPending', true);
 
         this._timeoutRegistry.add(
             constants.SACRED_ENTER_DEBOUNCE_MS,
@@ -378,7 +378,7 @@ export class ResizeHandler {
                     !isWindowAlive(window) ||
                     !this.windowingManager.isMaximizedOrFullscreen(window)
                 ) {
-                    WindowState.remove(window, 'sacredEnterPending');
+                    ShellState.remove(window, 'sacredEnterPending');
                     Logger.log(
                         `[SACRED-ENTER] Window ${window.get_id()} already left sacred state - skipping isolation`
                     );
@@ -394,7 +394,7 @@ export class ResizeHandler {
                         currentMonitor
                     ).length <= 1
                 ) {
-                    WindowState.remove(window, 'sacredEnterPending');
+                    ShellState.remove(window, 'sacredEnterPending');
                     Logger.log(
                         `[SACRED-ENTER] Window ${window.get_id()} workspace no longer occupied - skipping isolation`
                     );
@@ -413,7 +413,7 @@ export class ResizeHandler {
                             );
                     })
                     .catch(e => Logger.error(`Sacred sibling evacuation failed: ${e}`))
-                    .finally(() => WindowState.remove(window, 'sacredEnterPending'));
+                    .finally(() => ShellState.remove(window, 'sacredEnterPending'));
                 return GLib.SOURCE_REMOVE;
             },
             'resizeHandler_sacredEnterDebounce'
@@ -426,34 +426,34 @@ export class ResizeHandler {
     // same exit is safe; the second call just finds nothing left to undo.
     tryExitSacred(window) {
         // Born-maximized windows: don't set unmaximizing flag or try undo
-        if (WindowState.get(window, 'openedMaximized')) {
+        if (ShellState.get(window, 'openedMaximized')) {
             return;
         }
-        if (WindowState.get(window, 'unmaximizing')) {
+        if (ShellState.get(window, 'unmaximizing')) {
             return;
         }
-        WindowState.set(window, 'unmaximizing', true);
-        const maxInfo = WindowState.get(window, 'maximizedUndoInfo');
+        ShellState.set(window, 'unmaximizing', true);
+        const maxInfo = ShellState.get(window, 'maximizedUndoInfo');
         if (maxInfo) {
             Logger.log(`[SACRED-EXIT] Window ${window.get_id()} was unmaximized - attempting undo`);
             this.handleUnmaximizeUndo(window, maxInfo);
-            WindowState.remove(window, 'maximizedUndoInfo');
+            ShellState.remove(window, 'maximizedUndoInfo');
         } else {
             // The maximized window stayed in place while its siblings were evacuated,
             // so there is no workspace move to undo. Retile after Mutter commits the
             // restored frame so it uses the monitor's current membership instead of
             // returning to its stale pre-maximize slot.
             const preferredSize =
-                WindowState.get(window, 'preferredSize') || WindowState.get(window, 'openingSize');
+                ShellState.get(window, 'preferredSize') || ShellState.get(window, 'openingSize');
             if (preferredSize) {
-                WindowState.set(window, 'targetRestoredSize', preferredSize);
+                ShellState.set(window, 'targetRestoredSize', preferredSize);
             }
             this._ext.windowHandler.settleSacredExit(window, 'unmaximize');
             this._timeoutRegistry.add(
                 constants.RESIZE_SETTLE_DELAY_MS,
                 () => {
-                    WindowState.remove(window, 'unmaximizing');
-                    WindowState.remove(window, 'targetRestoredSize');
+                    ShellState.remove(window, 'unmaximizing');
+                    ShellState.remove(window, 'targetRestoredSize');
                     return GLib.SOURCE_REMOVE;
                 },
                 'resizeHandler_settleSoloUnmaximize'
@@ -467,7 +467,7 @@ export class ResizeHandler {
             if (!this.windowingManager.isRelated(window)) return;
 
             // Windows pending in the evaluation queue haven't been processed yet, so ignore size changes
-            if (WindowState.get(window, 'pendingInQueue')) return;
+            if (ShellState.get(window, 'pendingInQueue')) return;
 
             const rect = window.get_frame_rect();
             if (
@@ -477,11 +477,11 @@ export class ResizeHandler {
                 return;
 
             if (
-                WindowState.get(window, 'isSmartResizing') ||
-                WindowState.get(window, 'isReverseSmartResizing')
+                ShellState.get(window, 'isSmartResizing') ||
+                ShellState.get(window, 'isReverseSmartResizing')
             ) {
                 Logger.log(
-                    `[GUARD-BLOCK] onSizeChanged short-circuited for ${window.get_id()} - isSmartResizing=${WindowState.get(window, 'isSmartResizing')} isReverseSmartResizing=${WindowState.get(window, 'isReverseSmartResizing')}`
+                    `[GUARD-BLOCK] onSizeChanged short-circuited for ${window.get_id()} - isSmartResizing=${ShellState.get(window, 'isSmartResizing')} isReverseSmartResizing=${ShellState.get(window, 'isReverseSmartResizing')}`
                 );
                 this._sizeChanged = false;
                 return;
@@ -489,7 +489,7 @@ export class ResizeHandler {
 
             // Detect client-side clamping after smart resize.
             // If actual size > target, the client enforced a larger minimum.
-            const pendingSmartSize = WindowState.get(window, 'targetSmartResizeSize');
+            const pendingSmartSize = ShellState.get(window, 'targetSmartResizeSize');
             if (pendingSmartSize) {
                 if (
                     rect.width > pendingSmartSize.width + 2 ||
@@ -509,26 +509,26 @@ export class ResizeHandler {
                     this._commitClampedSize(window, pendingSmartSize, rect);
                 } else {
                     // A frame observed below a recorded minimum disproves it, so drop the pin.
-                    const minW = WindowState.get(window, 'actualMinWidth');
-                    const minH = WindowState.get(window, 'actualMinHeight');
+                    const minW = ShellState.get(window, 'actualMinWidth');
+                    const minH = ShellState.get(window, 'actualMinHeight');
                     if ((minW && rect.width < minW - 2) || (minH && rect.height < minH - 2)) {
-                        WindowState.remove(window, 'actualMinWidth');
-                        WindowState.remove(window, 'actualMinHeight');
+                        ShellState.remove(window, 'actualMinWidth');
+                        ShellState.remove(window, 'actualMinHeight');
                     }
-                    WindowState.set(window, 'targetSmartResizeSize', null);
+                    ShellState.set(window, 'targetSmartResizeSize', null);
                     this._disarmClampVerification(window);
                 }
 
                 // A sacred restore waits on this same size-changed, and the resize that just
                 // landed is the one it ordered itself. Returning here would strand it until
                 // the safety timeout.
-                if (WindowState.get(window, 'isRestoringSacred') === undefined) {
+                if (ShellState.get(window, 'isRestoringSacred') === undefined) {
                     this._sizeChanged = false;
                     return;
                 }
             }
 
-            const originWorkspaceIndex = WindowState.get(window, 'isRestoringSacred');
+            const originWorkspaceIndex = ShellState.get(window, 'isRestoringSacred');
             if (originWorkspaceIndex !== undefined) {
                 // If the window is no longer sacred (maximized or fullscreen), it has finished resizing in place.
                 if (!this.windowingManager.isMaximizedOrFullscreen(window)) {
@@ -543,32 +543,32 @@ export class ResizeHandler {
             }
 
             if (this.windowingManager.isMaximizedOrFullscreen(window)) {
-                WindowState.remove(window, 'isEnteringSacred');
+                ShellState.remove(window, 'isEnteringSacred');
                 this._sizeChanged = false;
                 return;
             }
 
-            if (WindowState.get(window, 'unmaximizing')) {
+            if (ShellState.get(window, 'unmaximizing')) {
                 this._sizeChanged = false;
                 return;
             }
 
             if (
-                WindowState.get(window, 'actualMinWidth') &&
-                rect.width > WindowState.get(window, 'actualMinWidth') + 20
+                ShellState.get(window, 'actualMinWidth') &&
+                rect.width > ShellState.get(window, 'actualMinWidth') + 20
             ) {
-                WindowState.remove(window, 'actualMinWidth');
-                WindowState.remove(window, 'actualMinHeight');
+                ShellState.remove(window, 'actualMinWidth');
+                ShellState.remove(window, 'actualMinHeight');
             }
 
-            const isConstrained = WindowState.get(window, 'isConstrainedByMosaic');
+            const isConstrained = ShellState.get(window, 'isConstrainedByMosaic');
             const isManualResizeAction = this._currentGrabOp && isResizeGrabOp(this._currentGrabOp);
 
             // If constrained but dimensions differ significantly from Smart Resize target,
             // assume an external or ambient resize and lift the constraint.
             let userForcedResize = isManualResizeAction;
             if (!userForcedResize && isConstrained) {
-                const target = WindowState.get(window, 'targetSmartResizeSize');
+                const target = ShellState.get(window, 'targetSmartResizeSize');
                 if (target) {
                     const wDiff = Math.abs(rect.width - target.width);
                     const hDiff = Math.abs(rect.height - target.height);
@@ -598,7 +598,7 @@ export class ResizeHandler {
             // An ease echoes back the size the layout picked, which says nothing about
             // what the window wants. Anything else arriving mid-ease is the client's own
             // size, so that one belongs in preferredSize. No target means no ease to echo.
-            const easeTarget = WindowState.get(window, 'isMosaicResizing')
+            const easeTarget = ShellState.get(window, 'isMosaicResizing')
                 ? this.animationsManager.getAnimatingTarget(window.get_id())
                 : null;
             const isEaseEcho =
@@ -621,13 +621,13 @@ export class ResizeHandler {
                 );
             } else if (userForcedResize) {
                 // Manual resize always updates preferredSize and clears constraints
-                WindowState.set(window, 'preferredSize', {
+                ShellState.set(window, 'preferredSize', {
                     width: rect.width,
                     height: rect.height,
                 });
                 MosaicModel.learn(window, rect);
                 if (isConstrained) {
-                    WindowState.set(window, 'isConstrainedByMosaic', false);
+                    ShellState.set(window, 'isConstrainedByMosaic', false);
                     Logger.log(`Manual resize for ${window.get_id()} - cleared constraint`);
                 }
                 Logger.log(
@@ -637,17 +637,17 @@ export class ResizeHandler {
                 // If NOT constrained and NOT manual, it might be an initial placement or legitimate external resize
                 // But we still guard against transition states
                 if (
-                    WindowState.get(window, 'isEnteringSacred') ||
-                    WindowState.get(window, 'unmaximizing') ||
-                    WindowState.get(window, 'isRestoringSacred') ||
-                    WindowState.get(window, 'openedMaximized') ||
-                    (WindowState.get(window, 'isMosaicResizing') && !clientOwnedSize)
+                    ShellState.get(window, 'isEnteringSacred') ||
+                    ShellState.get(window, 'unmaximizing') ||
+                    ShellState.get(window, 'isRestoringSacred') ||
+                    ShellState.get(window, 'openedMaximized') ||
+                    (ShellState.get(window, 'isMosaicResizing') && !clientOwnedSize)
                 ) {
                     Logger.log(
                         `onSizeChanged: Save blocked by transition flag for ${window.get_id()}`
                     );
                 } else {
-                    const currentPreferredSize = WindowState.get(window, 'preferredSize');
+                    const currentPreferredSize = ShellState.get(window, 'preferredSize');
                     if (currentPreferredSize) {
                         const widthDiff = Math.abs(rect.width - currentPreferredSize.width);
                         const heightDiff = Math.abs(rect.height - currentPreferredSize.height);
@@ -655,7 +655,7 @@ export class ResizeHandler {
                             widthDiff > constants.ANIMATION_DIFF_THRESHOLD ||
                             heightDiff > constants.ANIMATION_DIFF_THRESHOLD
                         ) {
-                            WindowState.set(window, 'preferredSize', {
+                            ShellState.set(window, 'preferredSize', {
                                 width: rect.width,
                                 height: rect.height,
                             });
@@ -664,8 +664,8 @@ export class ResizeHandler {
                                 `Preferred size updated (ambient): ${window.get_id()} = ${rect.width}x${rect.height}`
                             );
                         }
-                    } else if (WindowState.get(window, 'geometryReady')) {
-                        WindowState.set(window, 'preferredSize', {
+                    } else if (ShellState.get(window, 'geometryReady')) {
+                        ShellState.set(window, 'preferredSize', {
                             width: rect.width,
                             height: rect.height,
                         });
@@ -677,7 +677,7 @@ export class ResizeHandler {
                 }
             }
 
-            WindowState.remove(window, 'isEnteringSacred');
+            ShellState.remove(window, 'isEnteringSacred');
 
             if (this._skipNextTiling === window.get_id()) return;
 
@@ -692,7 +692,7 @@ export class ResizeHandler {
             // A new window commits its first size before the arrival pipeline has
             // placed it, and this global handler sees that ahead of the queue. Tiling
             // on it just runs the same pass the arrival evaluation is about to run.
-            if (WindowState.get(window, 'arrivalPending')) {
+            if (ShellState.get(window, 'arrivalPending')) {
                 this._sizeChanged = false;
                 return;
             }
@@ -705,7 +705,7 @@ export class ResizeHandler {
             const workspace = window.get_workspace();
             const monitor = window.get_monitor();
 
-            if (WindowState.get(window, 'movedByOverflow')) {
+            if (ShellState.get(window, 'movedByOverflow')) {
                 this._sizeChanged = false;
                 return;
             }
@@ -745,10 +745,10 @@ export class ResizeHandler {
                     const isSolo = mosaicWindows.length <= 1;
 
                     // Block moves during smart resize to prevent expelling windows on revert.
-                    const isSmartResizing = this.tilingManager._isSmartResizingBlocked;
+                    const isSmartResizing = this.tilingManager.isSmartResizingBlocked;
                     // Skip ghost detection right after smart resize to prevent false positives from unsettled rects.
                     const hasUnsettledSmartResize =
-                        WindowState.get(window, 'targetSmartResizeSize') !== null;
+                        ShellState.get(window, 'targetSmartResizeSize') !== null;
 
                     if (
                         !canFit &&
@@ -758,8 +758,8 @@ export class ResizeHandler {
                         !hasUnsettledSmartResize
                     ) {
                         if (
-                            WindowState.get(window, 'waitingForGeometry') ||
-                            !WindowState.get(window, 'geometryReady')
+                            ShellState.get(window, 'waitingForGeometry') ||
+                            !ShellState.get(window, 'geometryReady')
                         ) {
                             this._sizeChanged = false;
                             return;
@@ -830,8 +830,8 @@ export class ResizeHandler {
                 }
 
                 if (
-                    WindowState.get(window, 'isSmartResizing') ||
-                    this.tilingManager._isSmartResizingBlocked
+                    ShellState.get(window, 'isSmartResizing') ||
+                    this.tilingManager.isSmartResizingBlocked
                 ) {
                     this._sizeChanged = false;
                     return;
@@ -852,7 +852,7 @@ export class ResizeHandler {
 
                 // Leaving an edge tile briefly restores a full-size window into a tight mosaic; that
                 // transient over-size frame must miniaturize in place, not eject to a new workspace.
-                if (this._ext.dragHandler?._restoringFromEdgeTile) {
+                if (this._ext.grabHandler?.isRestoringFromEdgeTile) {
                     this._sizeChanged = false;
                     return;
                 }
@@ -869,8 +869,8 @@ export class ResizeHandler {
                 if (!canFit && !isSolo) {
                     if (this._resizeOverflowWindow !== window) {
                         if (
-                            WindowState.get(window, 'waitingForGeometry') ||
-                            !WindowState.get(window, 'geometryReady')
+                            ShellState.get(window, 'waitingForGeometry') ||
+                            !ShellState.get(window, 'geometryReady')
                         ) {
                             this._sizeChanged = false;
                             return;
@@ -943,7 +943,7 @@ export class ResizeHandler {
         this._timeoutRegistry.add(
             constants.SACRED_RESTORE_SAFETY_TIMEOUT_MS,
             () => {
-                if (WindowState.get(window, 'isRestoringSacred') === originWorkspaceIndex) {
+                if (ShellState.get(window, 'isRestoringSacred') === originWorkspaceIndex) {
                     Logger.log(
                         `[SACRED-TIMEOUT] Window ${window.get_id()} never confirmed unmaximize - forcing deferred move`
                     );
@@ -958,7 +958,7 @@ export class ResizeHandler {
     // Clearing the flag below makes this safe to call twice, since the real
     // signal and the timeout above can both end up calling it.
     completeSacredReturn(window, originWorkspaceIndex) {
-        if (WindowState.get(window, 'isRestoringSacred') !== originWorkspaceIndex) return;
+        if (ShellState.get(window, 'isRestoringSacred') !== originWorkspaceIndex) return;
 
         Logger.log(
             `[SACRED-MOVE] Window ${window.get_id()} finished in-place resize. Moving to origin workspace ${originWorkspaceIndex}.`
@@ -969,9 +969,9 @@ export class ResizeHandler {
             originWorkspaceIndex < 0 ||
             originWorkspaceIndex >= workspaceManager.get_n_workspaces()
         ) {
-            WindowState.remove(window, 'isRestoringSacred');
-            WindowState.remove(window, 'sacredFitConfirmed');
-            WindowState.remove(window, 'pendingMiniaturesForReturn');
+            ShellState.remove(window, 'isRestoringSacred');
+            ShellState.remove(window, 'sacredFitConfirmed');
+            ShellState.remove(window, 'pendingMiniaturesForReturn');
             return;
         }
 
@@ -980,8 +980,8 @@ export class ResizeHandler {
         const oldWorkspace = window.get_workspace();
         // handleUnmaximizeUndo sets this once it already checked the window
         // fits, so the tile pass below doesn't second-guess it as overflow.
-        const fitConfirmed = WindowState.get(window, 'sacredFitConfirmed') === true;
-        const pendingMiniatures = WindowState.get(window, 'pendingMiniaturesForReturn') || [];
+        const fitConfirmed = ShellState.get(window, 'sacredFitConfirmed') === true;
+        const pendingMiniatures = ShellState.get(window, 'pendingMiniaturesForReturn') || [];
 
         // MOVE ATOMICALLY
         window.change_workspace(originWS);
@@ -989,20 +989,19 @@ export class ResizeHandler {
         this.windowingManager.showWorkspaceSwitcher(originWS, monitor);
 
         // CLEAR FLAGS IMMEDIATELY to prevent double-move
-        WindowState.remove(window, 'isRestoringSacred');
-        WindowState.remove(window, 'sacredFitConfirmed');
-        WindowState.remove(window, 'pendingMiniaturesForReturn');
+        ShellState.remove(window, 'isRestoringSacred');
+        ShellState.remove(window, 'sacredFitConfirmed');
+        ShellState.remove(window, 'pendingMiniaturesForReturn');
 
         // TILE IN DESTINATION
         afterWorkspaceSwitch(() => {
             Logger.log(`Triggering tiling in destination workspace ${originWorkspaceIndex}`);
-            this.tilingManager._isSmartResizingBlocked = true;
-            try {
-                this.tilingManager._pendingMiniatureWindows = pendingMiniatures;
-                this.tilingManager.tileWorkspaceWindows(originWS, window, monitor, fitConfirmed);
-            } finally {
-                this.tilingManager._isSmartResizingBlocked = false;
-            }
+            this.tilingManager.runSmartResizeTile(originWS, {
+                monitor,
+                pendingWindows: pendingMiniatures,
+                referenceWindow: window,
+                preventOverflow: fitConfirmed,
+            });
             if (isWorkspaceAlive(oldWorkspace, workspaceManager)) {
                 this.tilingManager.tileWorkspaceWindows(oldWorkspace, null, monitor, true);
             }
@@ -1014,10 +1013,10 @@ export class ResizeHandler {
             this._timeoutRegistry.add(
                 constants.RESIZE_SETTLE_DELAY_MS,
                 () => {
-                    WindowState.remove(window, 'unmaximizing');
-                    WindowState.remove(window, 'isConstrainedByMosaic');
-                    WindowState.remove(window, 'targetRestoredSize');
-                    WindowState.remove(window, 'openedMaximized');
+                    ShellState.remove(window, 'unmaximizing');
+                    ShellState.remove(window, 'isConstrainedByMosaic');
+                    ShellState.remove(window, 'targetRestoredSize');
+                    ShellState.remove(window, 'openedMaximized');
                     return GLib.SOURCE_REMOVE;
                 },
                 'resizeHandler_settleRestoreSacred'
@@ -1032,7 +1031,7 @@ export class ResizeHandler {
         const windowId = window.get_id();
 
         if (preMaxSize) {
-            WindowState.set(window, 'openingSize', preMaxSize);
+            ShellState.set(window, 'openingSize', preMaxSize);
         }
 
         if (origIndex >= workspaceManager.get_n_workspaces()) {
@@ -1045,9 +1044,9 @@ export class ResizeHandler {
             Logger.log(
                 `handleUnmaximizeUndo: Window ${windowId} unmaximized on SAME workspace - tiling immediately`
             );
-            WindowState.set(window, 'unmaximizing', true);
+            ShellState.set(window, 'unmaximizing', true);
             if (preMaxSize) {
-                WindowState.set(window, 'targetRestoredSize', preMaxSize);
+                ShellState.set(window, 'targetRestoredSize', preMaxSize);
             }
 
             this.tilingManager.tileWorkspaceWindows(currentWorkspace, window, monitor, true);
@@ -1055,8 +1054,8 @@ export class ResizeHandler {
             this._timeoutRegistry.add(
                 constants.RESIZE_SETTLE_DELAY_MS + 100,
                 () => {
-                    WindowState.remove(window, 'unmaximizing');
-                    WindowState.remove(window, 'targetRestoredSize');
+                    ShellState.remove(window, 'unmaximizing');
+                    ShellState.remove(window, 'targetRestoredSize');
                     return GLib.SOURCE_REMOVE;
                 },
                 'resizeHandler_settleUnmaximizeSame'
@@ -1065,7 +1064,7 @@ export class ResizeHandler {
         }
 
         if (preMaxSize) {
-            WindowState.set(window, 'preferredSize', preMaxSize);
+            ShellState.set(window, 'preferredSize', preMaxSize);
         }
 
         const existingWindows = targetWorkspace
@@ -1099,7 +1098,7 @@ export class ResizeHandler {
             if (canFit) {
                 pendingMiniatures = fitResult.pendingWindows ?? [];
                 // Set early: intermediate tile calls treat these as pending-mini; afterWorkspaceSwitch re-sets before final pass.
-                this.tilingManager._pendingMiniatureWindows = pendingMiniatures;
+                this.tilingManager.queuePendingMiniatures(pendingMiniatures);
             }
         }
 
@@ -1118,22 +1117,22 @@ export class ResizeHandler {
         }
 
         window.unmaximize();
-        WindowState.set(window, 'unmaximizing', true);
-        WindowState.set(window, 'isConstrainedByMosaic', true);
+        ShellState.set(window, 'unmaximizing', true);
+        ShellState.set(window, 'isConstrainedByMosaic', true);
 
         if (preMaxSize) {
-            WindowState.set(window, 'targetRestoredSize', preMaxSize);
-            WindowState.set(window, 'openingSize', preMaxSize);
-            WindowState.set(window, 'preferredSize', preMaxSize);
+            ShellState.set(window, 'targetRestoredSize', preMaxSize);
+            ShellState.set(window, 'openingSize', preMaxSize);
+            ShellState.set(window, 'preferredSize', preMaxSize);
         }
 
         // Wait for the real size-changed confirmation instead of guessing with
         // a timer; a fixed delay could move the window before it's actually
         // done resizing, and it'd show up at the destination still huge.
-        WindowState.set(window, 'isRestoringSacred', origIndex);
-        WindowState.set(window, 'sacredFitConfirmed', true);
+        ShellState.set(window, 'isRestoringSacred', origIndex);
+        ShellState.set(window, 'sacredFitConfirmed', true);
         if (pendingMiniatures.length > 0) {
-            WindowState.set(window, 'pendingMiniaturesForReturn', pendingMiniatures);
+            ShellState.set(window, 'pendingMiniaturesForReturn', pendingMiniatures);
         }
         this.scheduleSacredRestoreSafety(window, origIndex);
         Logger.log(

@@ -10,6 +10,17 @@ mkdir -p "$results_dir"
 find "$results_dir" -maxdepth 1 -type f -name '*.log' -delete
 npm run build
 
+restart_document_portal() {
+    local command_status=$?
+
+    trap - EXIT
+    if ! systemctl --user restart xdg-document-portal.service; then
+        echo "WARN Failed to restart xdg-document-portal.service" >&2
+    fi
+    exit "$command_status"
+}
+trap restart_document_portal EXIT
+
 passed=0
 failed=0
 
@@ -31,12 +42,11 @@ for scenario in "$repo_dir"/test/integration/scenarios/*.js; do
     command+=("$scenario")
 
     echo "RUN  $name"
+    scenario_failed=0
     if GTK_A11Y=none GSETTINGS_BACKEND=memory timeout 60s dbus-run-session -- "${command[@]}" >"$log_file" 2>&1; then
-        echo "PASS $name"
-        passed=$((passed + 1))
+        :
     else
-        echo "FAIL $name"
-        failed=$((failed + 1))
+        scenario_failed=1
         sed -n '/Script failed:/,+14p' "$log_file"
         if ! grep -q 'Script failed:' "$log_file"; then
             tail -30 "$log_file"
@@ -46,7 +56,16 @@ for scenario in "$repo_dir"/test/integration/scenarios/*.js; do
     critical_count=$(grep -Ec '(GNOME Shell|libmutter|Gjs|Clutter)-CRITICAL' "$log_file" || true)
     critical_count=${critical_count:-0}
     if [[ "$critical_count" != "0" ]]; then
-        echo "WARN $name emitted $critical_count critical log message(s); see $log_file"
+        scenario_failed=1
+        echo "CRIT $name emitted $critical_count critical log message(s); see $log_file"
+    fi
+
+    if [[ "$scenario_failed" == "0" ]]; then
+        echo "PASS $name"
+        passed=$((passed + 1))
+    else
+        echo "FAIL $name"
+        failed=$((failed + 1))
     fi
 done
 

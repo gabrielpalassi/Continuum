@@ -4,7 +4,7 @@ The integration scenarios treat Continuum as a black box. Their expectations
 come from the user-facing behavior documented in the project README and schema,
 not from internal implementation details.
 
-Run fast policy tests (layout decisions, mosaic state, liveness, window state,
+Run fast policy tests (layout decisions, mosaic state, Shell-object liveness and state,
 and shortcut/schema contracts):
 
 ```bash
@@ -30,7 +30,8 @@ npm run test:all
 Each integration scenario starts GNOME Shell 50 as an isolated headless Wayland
 compositor, installs the freshly built extension, creates real GTK windows, and
 asserts observable `Meta.Window` geometry and state. Logs are written under
-`test-results/integration/`.
+`test-results/integration/`. A scenario also fails when GNOME Shell, Mutter,
+GJS, or Clutter emits a critical log message.
 
 The scenarios cover:
 
@@ -42,13 +43,15 @@ The scenarios cover:
 - existing and born-maximized isolation;
 - fullscreen isolation and restoration;
 - overflow miniatures, automatic restoration, anti-flapping, and restore anchors;
-- configured edge-tiling and swapping keybindings at schema level;
+- configured edge-tiling and swapping keybindings, including one-action cross-edge transitions;
 - teardown cleanup and re-enable;
 - multi-monitor distribution, close rebalance, maximized placement, and user maximize round trips;
-- relative order preservation and idle layout stability.
+- relative order preservation and idle layout stability;
 - direct mosaic swapping below the headless compositor's unsupported global-shortcut layer;
 - real GTK client minimum-size constraints under overflow pressure;
-- pointer-driven move and resize grab lifecycles.
+- pointer-driven move, cross-monitor drag hints, left/right edge-drop anchoring, multi-window reordering, and resize grab lifecycles;
+- complementary half/quarter edge-pair resizing and animation guard behavior;
+- interrupted miniature create/restore animation cleanup.
 
 Headless tests exercise real Mutter and Shell state transitions, but they do not
 replace final checks in a logged-in Wayland session for global shortcut dispatch,

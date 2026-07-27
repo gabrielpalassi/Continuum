@@ -118,10 +118,10 @@ Continuum is a GNOME Shell 50 extension written as GJS ES modules. Its runtime e
 
 | Area                | Main modules                                                           | Responsibility                                                                                                        |
 | ------------------- | ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| Extension lifecycle | `extension.js`, `settingsOverrider.js`, `timing.js`, `liveness.js`     | Own shared services, Shell integration, temporary settings changes, and asynchronous cleanup.                         |
-| Window lifecycle    | `windowHandler.js`, `windowing.js`, `windowState.js`                   | Classify windows, track per-window state, queue placement, and handle creation, removal, and monitor changes.         |
-| Mosaic layout       | `tiling.js`, `reordering.js`, `swapping.js`, `edgeTiling.js`           | Compute layouts, keep windows fitted, reorder or swap tiles, and manage edge-tile zones.                              |
-| User interaction    | `dragHandler.js`, `resizeHandler.js`, `grabOps.js`, `drawing.js`       | Coordinate move/resize grabs, previews, smart resizing, and visual guides.                                            |
+| Extension lifecycle | `extension.js`, `settingsOverrider.js`, `timing.js`                    | Own shared services, Shell integration, temporary settings changes, and asynchronous cleanup.                         |
+| Window lifecycle    | `windowHandler.js`, `windowing.js`, `shellState.js`                    | Classify windows, safely access Shell objects, track per-window state, queue placement, and handle lifecycle changes. |
+| Mosaic layout       | `tiling.js`, `layoutPlanning.js`, `swapping.js`, `edgeTiling.js`       | Compute layouts, keep windows fitted, swap tiles, and manage edge-tile zones.                                         |
+| User interaction    | `grabHandler.js`, `resizeHandler.js`, `drawing.js`                     | Coordinate move/resize grabs, tile reordering, previews, smart resizing, and visual guides.                           |
 | Visual behavior     | `animations.js`, `miniature.js`, `mosaicModel.js`, `mosaicRenderer.js` | Animate placement, represent overflow windows as miniatures, and keep the live mosaic synchronized with the Overview. |
 | Workspace behavior  | `workspaceOverview.js`                                                 | Show the overview when the active workspace becomes empty and hide only an overview it opened.                        |
 | Attention behavior  | `windowAttention.js`                                                   | Replace "Window is ready" notifications with direct activation for attention-seeking windows.                         |
