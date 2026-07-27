@@ -429,6 +429,9 @@ export class ResizeHandler {
         if (WindowState.get(window, 'openedMaximized')) {
             return;
         }
+        if (WindowState.get(window, 'unmaximizing')) {
+            return;
+        }
         WindowState.set(window, 'unmaximizing', true);
         const maxInfo = WindowState.get(window, 'maximizedUndoInfo');
         if (maxInfo) {
@@ -436,13 +439,16 @@ export class ResizeHandler {
             this.handleUnmaximizeUndo(window, maxInfo);
             WindowState.remove(window, 'maximizedUndoInfo');
         } else {
-            // Window was never isolated (it was alone in its workspace), so there's
-            // nothing to undo; just let the transition flags clear after it settles.
+            // The maximized window stayed in place while its siblings were evacuated,
+            // so there is no workspace move to undo. Retile after Mutter commits the
+            // restored frame so it uses the monitor's current membership instead of
+            // returning to its stale pre-maximize slot.
             const preferredSize =
                 WindowState.get(window, 'preferredSize') || WindowState.get(window, 'openingSize');
             if (preferredSize) {
                 WindowState.set(window, 'targetRestoredSize', preferredSize);
             }
+            this._ext.windowHandler.settleSacredExit(window, 'unmaximize');
             this._timeoutRegistry.add(
                 constants.RESIZE_SETTLE_DELAY_MS,
                 () => {

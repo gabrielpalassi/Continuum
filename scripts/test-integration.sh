@@ -19,10 +19,11 @@ for scenario in "$repo_dir"/test/integration/scenarios/*.js; do
     command=(
         gnome-shell-test-tool
         --headless
-        --disable-animations
-        --extension
-        "$extension_zip"
     )
+    if [[ "$name" != *.animated.* ]]; then
+        command+=(--disable-animations)
+    fi
+    command+=(--extension "$extension_zip")
 
     if [[ "$name" == *.multimonitor ]]; then
         command+=(--wrap "$monitor_wrapper")
@@ -30,7 +31,7 @@ for scenario in "$repo_dir"/test/integration/scenarios/*.js; do
     command+=("$scenario")
 
     echo "RUN  $name"
-    if GTK_A11Y=none timeout 60s dbus-run-session -- "${command[@]}" >"$log_file" 2>&1; then
+    if GTK_A11Y=none GSETTINGS_BACKEND=memory timeout 60s dbus-run-session -- "${command[@]}" >"$log_file" 2>&1; then
         echo "PASS $name"
         passed=$((passed + 1))
     else

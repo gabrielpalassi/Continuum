@@ -44,7 +44,7 @@ The scenarios cover:
 - overflow miniatures, automatic restoration, anti-flapping, and restore anchors;
 - configured edge-tiling and swapping keybindings at schema level;
 - teardown cleanup and re-enable;
-- multi-monitor distribution, close rebalance, and maximized placement;
+- multi-monitor distribution, close rebalance, maximized placement, and user maximize round trips;
 - relative order preservation and idle layout stability.
 - direct mosaic swapping below the headless compositor's unsupported global-shortcut layer;
 - real GTK client minimum-size constraints under overflow pressure;

@@ -10,7 +10,12 @@ import Meta from 'gi://Meta';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as WorkspaceSwitcherPopup from 'resource:///org/gnome/shell/ui/workspaceSwitcherPopup.js';
 import {afterWorkspaceSwitch} from './timing.js';
-import {MONITOR_PLACEMENT_TIMEOUT_MS, RETILE_DELAY_MS, TileZone} from './constants.js';
+import {
+    ANIMATION_DIFF_THRESHOLD,
+    MONITOR_PLACEMENT_TIMEOUT_MS,
+    RETILE_DELAY_MS,
+    TileZone,
+} from './constants.js';
 import * as WindowState from './windowState.js';
 import {IS_MINIATURE} from './windowState.js';
 import {isWindowAlive, isWorkspaceAlive} from './liveness.js';
@@ -36,6 +41,7 @@ export class WindowingManager {
         // one native list_windows() pass.
         // WeakMap<Workspace, Map<String, Window[]>>
         this._windowsCache = new WeakMap();
+        this._monitorPlacementCallbacks = new WeakMap();
     }
 
     getTimestamp() {
@@ -212,6 +218,18 @@ export class WindowingManager {
     }
 
     moveOversizedWindow(window, options = {switchFocus: true}) {
+        // A monitor placement is the authoritative response to the current layout
+        // decision. Signals emitted by move_to_monitor can synchronously re-enter
+        // overflow logic with stale source-monitor membership; allowing that stale
+        // decision to change workspaces splits one transaction across two monitors
+        // and two workspaces.
+        if (WindowState.get(window, 'monitorPlacementTarget') !== undefined) {
+            Logger.log(
+                `[PLACEMENT] Ignoring stale overflow request for window ${window.get_id()} during monitor placement`
+            );
+            return Promise.resolve(window.get_workspace());
+        }
+
         return new Promise(resolve => {
             const workspaceManager = global.workspace_manager;
             const monitor = window.get_monitor();
@@ -632,9 +650,13 @@ export class WindowingManager {
         if (pendingTarget !== undefined) {
             if (pendingTarget === targetMonitor) {
                 Logger.log(
-                    `[PLACEMENT] Window ${window.get_id()} is already moving to monitor ${targetMonitor}; skipping duplicate request`
+                    `[PLACEMENT] Window ${window.get_id()} is already moving to monitor ${targetMonitor}; joining existing request`
                 );
-                onSettled?.(false);
+                if (onSettled) {
+                    const callbacks = this._monitorPlacementCallbacks.get(window) ?? [];
+                    callbacks.push(onSettled);
+                    this._monitorPlacementCallbacks.set(window, callbacks);
+                }
                 return true;
             }
             Logger.log(
@@ -675,6 +697,9 @@ export class WindowingManager {
         }
         WindowState.set(window, 'monitorPlacementSource', sourceMonitor);
         WindowState.set(window, 'monitorPlacementTarget', targetMonitor);
+        this._monitorPlacementCallbacks.set(window, onSettled ? [onSettled] : []);
+        const sourceFrame = window.get_frame_rect();
+        const expectedSize = this._tilingManager?.getPreferredSize(window) ?? sourceFrame;
         try {
             window.move_to_monitor(targetMonitor);
         } catch (e) {
@@ -687,7 +712,7 @@ export class WindowingManager {
             Logger.warn(
                 `[PLACEMENT] Failed moving window ${window.get_id()} to monitor ${targetMonitor}: ${e.message}`
             );
-            onSettled?.(false);
+            this._resolveMonitorPlacement(window, false);
             return false;
         }
         this.invalidateWindowsCache();
@@ -698,6 +723,7 @@ export class WindowingManager {
 
         let elapsed = 0;
         let lastStableFrame = null;
+        let stableFrameProbes = 0;
         const settlePlacement = () => {
             let currentMonitor;
             try {
@@ -707,7 +733,7 @@ export class WindowingManager {
                 WindowState.remove(window, 'monitorPlacementTarget');
                 WindowState.remove(window, 'monitorPlacementEntrancePending');
                 WindowState.remove(window, 'userPlacementDisplaced');
-                onSettled?.(false);
+                this._resolveMonitorPlacement(window, false);
                 return GLib.SOURCE_REMOVE;
             }
 
@@ -717,30 +743,36 @@ export class WindowingManager {
                 WindowState.remove(window, 'monitorPlacementTarget');
                 WindowState.remove(window, 'monitorPlacementEntrancePending');
                 WindowState.remove(window, 'userPlacementDisplaced');
-                onSettled?.(false);
+                this._resolveMonitorPlacement(window, false);
                 return GLib.SOURCE_REMOVE;
             }
 
             // Require the destination frame to stay unchanged for two probes. The
-            // monitor property can flip before a fullscreen client commits the
-            // correctly sized buffer, which would otherwise reveal a visible resize.
+            // monitor property can flip before Mutter commits destination geometry,
+            // which would let a later compositor commit overwrite our destination
+            // tiling. Fullscreen entrances additionally wait until their actor maps.
             const needsStableEntrance =
                 WindowState.get(window, 'monitorPlacementEntrancePending') === true;
-            if (currentMonitor === targetMonitor && !needsStableEntrance) {
-                this.finishMonitorPlacement(window, workspace, targetMonitor);
-                onSettled?.(true);
-                return GLib.SOURCE_REMOVE;
-            } else if (currentMonitor === targetMonitor && actor?.mapped) {
+            if (currentMonitor === targetMonitor && (!needsStableEntrance || actor?.mapped)) {
                 const frame = window.get_frame_rect();
+                const targetArea = workspace.get_work_area_for_monitor(targetMonitor);
+                const expectedWidth = Math.min(expectedSize.width, targetArea.width);
+                const expectedHeight = Math.min(expectedSize.height, targetArea.height);
+                const expectedSizeSettled =
+                    needsStableEntrance ||
+                    (Math.abs(frame.width - expectedWidth) <= ANIMATION_DIFF_THRESHOLD &&
+                        Math.abs(frame.height - expectedHeight) <= ANIMATION_DIFF_THRESHOLD);
                 const stable =
+                    expectedSizeSettled &&
                     lastStableFrame &&
                     frame.x === lastStableFrame.x &&
                     frame.y === lastStableFrame.y &&
                     frame.width === lastStableFrame.width &&
                     frame.height === lastStableFrame.height;
-                if (stable) {
+                stableFrameProbes = stable ? stableFrameProbes + 1 : 0;
+                if (stableFrameProbes >= 2) {
                     this.finishMonitorPlacement(window, workspace, targetMonitor);
-                    onSettled?.(true);
+                    this._resolveMonitorPlacement(window, true);
                     return GLib.SOURCE_REMOVE;
                 }
                 lastStableFrame = {
@@ -751,6 +783,7 @@ export class WindowingManager {
                 };
             } else {
                 lastStableFrame = null;
+                stableFrameProbes = 0;
             }
 
             elapsed += RETILE_DELAY_MS;
@@ -769,7 +802,7 @@ export class WindowingManager {
                 WindowState.remove(window, 'monitorPlacementEntrancePending');
                 this._animationsManager?.animateMonitorPlacementEntrance(window);
             }
-            onSettled?.(false);
+            this._resolveMonitorPlacement(window, false);
             return GLib.SOURCE_REMOVE;
         };
 
@@ -784,6 +817,18 @@ export class WindowingManager {
         }
 
         return true;
+    }
+
+    _resolveMonitorPlacement(window, success) {
+        const callbacks = this._monitorPlacementCallbacks.get(window) ?? [];
+        this._monitorPlacementCallbacks.delete(window);
+        for (const callback of callbacks) {
+            try {
+                callback(success);
+            } catch (e) {
+                Logger.warn(`Monitor placement callback failed: ${e.message}`);
+            }
+        }
     }
 
     finishMonitorPlacement(window, workspace, enteredMonitor = null) {
@@ -1021,5 +1066,6 @@ export class WindowingManager {
         this._timeoutRegistry = null;
         this._onOverflowChange = null;
         this._windowsCache = new WeakMap();
+        this._monitorPlacementCallbacks = new WeakMap();
     }
 }

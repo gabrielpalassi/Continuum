@@ -6,6 +6,7 @@
 
 import GLib from 'gi://GLib';
 import Clutter from 'gi://Clutter';
+import GObject from 'gi://GObject';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Logger from './logger.js';
 import * as constants from './constants.js';
@@ -210,7 +211,7 @@ export class WindowHandler {
                             WindowState.remove(win, 'openedMaximized');
                             WindowState.remove(win, 'unmaximizing');
                             WindowState.remove(win, 'isEnteringSacred');
-                            this._settleBornSacredExit(win, 'unmaximize');
+                            this.settleSacredExit(win, 'unmaximize');
                         } else {
                             this._ext.resizeHandler.tryExitSacred(win);
                         }
@@ -234,7 +235,7 @@ export class WindowHandler {
                     WindowState.remove(win, 'openedMaximized');
                     WindowState.remove(win, 'unmaximizing');
                     WindowState.remove(win, 'isEnteringSacred');
-                    this._settleBornSacredExit(win, 'unfullscreen');
+                    this.settleSacredExit(win, 'unfullscreen');
                 } else {
                     this._ext.resizeHandler.tryExitSacred(win);
                 }
@@ -299,36 +300,115 @@ export class WindowHandler {
         WindowState.remove(window, 'previousWorkspace');
     }
 
-    _isFrameMonitorSized(win) {
-        const ws = win.get_workspace();
-        const mon = win.get_monitor();
-        const wa = ws && mon !== null ? ws.get_work_area_for_monitor(mon) : null;
-        const frame = win.get_frame_rect();
-        return !!wa && frame.width >= wa.width && frame.height >= wa.height;
+    // The size-change signal arrives before Mutter commits the restored frame. Mark the
+    // transition so the subsequent compositor size-changed handler can center it and
+    // retarget Shell's already-prepared animation before the next paint.
+    settleSacredExit(win, label) {
+        WindowState.set(win, 'pendingSacredExitPosition', label);
+        const source = win.get_frame_rect();
+        WindowState.set(win, 'pendingSacredExitAnimationSource', {
+            x: source.x,
+            y: source.y,
+            width: source.width,
+            height: source.height,
+        });
+
+        // Property notifications are only a backup for clients that never emitted
+        // the compositor size-change signal. If the native hook does not claim this
+        // transition, still settle the real frame instead of leaving it at Mutter's
+        // stale pre-maximize position.
+        this._timeoutRegistry.add(
+            constants.ANIMATION_DURATION_MS + constants.RESIZE_SETTLE_DELAY_MS,
+            () => {
+                if (
+                    isWindowAlive(win) &&
+                    WindowState.get(win, 'pendingSacredExitPosition') !== undefined
+                )
+                    this.commitSacredExitPosition(win, {allowUnsettled: true});
+                return GLib.SOURCE_REMOVE;
+            },
+            'windowHandler_sacredExitFallback'
+        );
     }
 
-    // The state flips before the client commits the size that goes with it, so the frame
-    // here can still be the maximized one. Tiling on it sends a configure the client's own
-    // late commit then overrides, so wait for that commit.
-    _settleBornSacredExit(win, label) {
-        if (!this._isFrameMonitorSized(win)) {
-            this._captureAndTile(win, label);
-            return;
+    commitSacredExitPosition(win, {allowUnsettled = false} = {}) {
+        const label = WindowState.get(win, 'pendingSacredExitPosition');
+        if (label === undefined || !isWindowAlive(win)) return false;
+
+        const ws = win.get_workspace();
+        const mon = win.get_monitor();
+        const frame = win.get_frame_rect();
+        const area = ws && mon !== null ? this.tilingManager.getUsableWorkArea(ws, mon) : null;
+        if (!area || area.width <= 0 || area.height <= 0 || frame.width <= 0 || frame.height <= 0)
+            return false;
+
+        // Some clients emit separate confirmations for the two axes. Do not center
+        // an intermediate frame that still has a maximized dimension; the following
+        // size-changed signal will carry the complete restore. The timed fallback
+        // permits a genuinely clamped client to settle anyway.
+        const targetSize = WindowState.get(win, 'targetRestoredSize');
+        if (targetSize && !allowUnsettled) {
+            const widthStillMaximized =
+                targetSize.width < area.width - constants.ANIMATION_DIFF_THRESHOLD &&
+                frame.width >= area.width - constants.ANIMATION_DIFF_THRESHOLD;
+            const heightStillMaximized =
+                targetSize.height < area.height - constants.ANIMATION_DIFF_THRESHOLD &&
+                frame.height >= area.height - constants.ANIMATION_DIFF_THRESHOLD;
+            if (widthStillMaximized || heightStillMaximized) return false;
         }
 
-        let sizeId = null;
-        let unmanagedId = null;
-        const disconnect = () => {
-            if (sizeId) win.disconnect(sizeId);
-            if (unmanagedId) win.disconnect(unmanagedId);
-            sizeId = unmanagedId = null;
-        };
+        const x = Math.round(area.x + (area.width - frame.width) / 2);
+        const y = Math.round(area.y + (area.height - frame.height) / 2);
+        const source = WindowState.get(win, 'pendingSacredExitAnimationSource');
+        win.move_frame(true, x, y);
+        WindowState.remove(win, 'pendingSacredExitPosition');
+        WindowState.remove(win, 'pendingSacredExitAnimationSource');
 
-        sizeId = win.connect('size-changed', () => {
-            disconnect();
-            this._captureAndTile(win, label);
-        });
-        unmanagedId = win.connect('unmanaged', disconnect);
+        // Let Shell finish its native transform before synchronizing Mosaic's model.
+        // The real frame is already at the calculated solo position, so this pass is
+        // normally geometry-neutral.
+        this._timeoutRegistry.add(
+            constants.ANIMATION_DURATION_MS + 50,
+            () => {
+                if (isWindowAlive(win)) this._captureAndTile(win, label);
+                return GLib.SOURCE_REMOVE;
+            },
+            'windowHandler_sacredExitModelSync'
+        );
+        return {x, y, width: frame.width, height: frame.height, source};
+    }
+
+    retargetNativeSacredExitAnimation(actor, target) {
+        const animationInfo = actor?.__animationInfo;
+        const source = target.source ?? animationInfo?.oldRect;
+        if (!source || source.width <= 0 || source.height <= 0) return;
+
+        // Shell's bound size-changed handler runs before extension handlers and has
+        // already started easing toward Mutter's saved pre-maximize coordinates.
+        // Rebase its live translation transitions in place. Assigning the actor
+        // properties here would remove those transitions, leaving scale to animate
+        // toward the stale slot before Shell's completion handler snapped the actor
+        // to its real frame.
+        const retargetTransition = (animatedActor, property, from, to = null) => {
+            const transition =
+                animatedActor.get_transition(property) ??
+                animatedActor.get_transition(property.replace('-', '_'));
+            if (!transition || typeof transition.set_from !== 'function') return false;
+            transition.set_from(new GObject.Value(GObject.TYPE_FLOAT, from));
+            if (to !== null) transition.set_to(new GObject.Value(GObject.TYPE_FLOAT, to));
+            return true;
+        };
+        retargetTransition(actor, 'translation-x', source.x - target.x);
+        retargetTransition(actor, 'translation-y', source.y - target.y);
+
+        // Shell cross-fades an old-frame clone alongside the real actor. Its native
+        // x/y transitions can also start from Shell's stale oldRect. Rebase both ends
+        // in place; its native opacity and scale transitions continue untouched.
+        const clone = animationInfo.clone?.actor ?? animationInfo.clone;
+        if (clone) {
+            retargetTransition(clone, 'x', source.x, target.x);
+            retargetTransition(clone, 'y', source.y, target.y);
+        }
     }
 
     _captureAndTile(win, label) {
@@ -1536,6 +1616,10 @@ export class WindowHandler {
 
     onWindowCreated(window) {
         this.windowingManager.invalidateWindowsCache();
+        // Snapshot this at creation time. The readiness callback can remain pending
+        // while a hidden/unmapped window settles; re-reading sacred state there would
+        // mistake a later user maximize for a born-maximized window.
+        const bornSacred = this.windowingManager.isMaximizedOrFullscreen(window);
         // Distinguishes a later user maximize from the pre-creation size-change
         // signal emitted by clients that map already maximized/fullscreen.
         WindowState.set(window, 'creationObserved', true);
@@ -1547,7 +1631,7 @@ export class WindowHandler {
             Logger.log(`Window ${window.get_id()} opened with Shift, set always-on-top`);
         }
 
-        if (this.windowingManager.isMaximizedOrFullscreen(window)) {
+        if (bornSacred) {
             WindowState.set(window, 'openedMaximized', true);
             // Defense: clean up flags that onSizeChange may have set before window-created fired
             WindowState.remove(window, 'maximizedUndoInfo');
@@ -1574,8 +1658,28 @@ export class WindowHandler {
                     return GLib.SOURCE_REMOVE;
                 }
 
+                const sacredNow = this.windowingManager.isMaximizedOrFullscreen(window);
+                const normalPlacementCompleted =
+                    WindowState.get(window, 'lastEvaluatedAt') !== undefined &&
+                    !WindowState.get(window, 'arrivalPending');
+                // Preserve the mapped-late fallback for clients whose born-fullscreen
+                // state was not visible at window-created time. Once the normal arrival
+                // has completed, however, sacred state is a later user transition.
+                const creationSacred = bornSacred || (sacredNow && !normalPlacementCompleted);
+
+                if (!creationSacred && sacredNow) {
+                    // A normal window can be maximized while this creation-time
+                    // readiness gate is still waiting for it to become visible.
+                    // Sacred transition handling now owns placement; treating this
+                    // as a fresh arrival would move the window instead of its sibling.
+                    Logger.log(
+                        `Window ${window.get_id()} became sacred while creation readiness was pending; leaving placement to sacred transition`
+                    );
+                    return GLib.SOURCE_REMOVE;
+                }
+
                 // Use saved_rect for natural size (get_frame_rect matches monitor if Maximized).
-                if (this.windowingManager.isMaximizedOrFullscreen(window)) {
+                if (creationSacred) {
                     try {
                         const saved =
                             window.saved_rect ||
@@ -1613,7 +1717,7 @@ export class WindowHandler {
                     this.tilingManager.savePreferredSize(window);
                 }
 
-                if (this.windowingManager.isMaximizedOrFullscreen(window)) {
+                if (creationSacred) {
                     // Some fullscreen clients omit size-change and only expose
                     // sacred state once mapped. This is still their creation path,
                     // so treat them as born sacred before any monitor move.

@@ -583,9 +583,11 @@ export default class ContinuumExtension extends Extension {
             )
         );
         this._wmEventIds.push(
-            global.window_manager.connect('size-changed', (wm, win) =>
-                this.resizeHandler.onSizeChanged(wm, win)
-            )
+            global.window_manager.connect('size-changed', (wm, actor) => {
+                const target = this.windowHandler.commitSacredExitPosition(actor.meta_window);
+                if (target) this.windowHandler.retargetNativeSacredExitAnimation(actor, target);
+                this.resizeHandler.onSizeChanged(wm, actor);
+            })
         );
         this._displayEventIds.push(
             global.display.connect('window-created', (_, window) =>

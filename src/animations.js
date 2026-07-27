@@ -167,6 +167,7 @@ export const AnimationsManager = GObject.registerClass(
                     targetRect.width,
                     targetRect.height
                 );
+                if (userOp) window.move_frame(true, targetRect.x, targetRect.y);
                 this._clearMosaicResizingSoon(window);
                 const actor = window.get_compositor_private();
                 if (actor && !actor.is_destroyed()) {
@@ -215,7 +216,8 @@ export const AnimationsManager = GObject.registerClass(
                 lastTarget.x === targetRect.x &&
                 lastTarget.y === targetRect.y &&
                 lastTarget.width === targetRect.width &&
-                lastTarget.height === targetRect.height
+                lastTarget.height === targetRect.height &&
+                !userOp
             ) {
                 if (onComplete) onComplete();
                 return;
@@ -291,6 +293,10 @@ export const AnimationsManager = GObject.registerClass(
                 targetRect.width,
                 targetRect.height
             );
+            // During unmaximize, Mutter can accept the combined resize while
+            // retaining its saved position. Reassert the user-owned position before
+            // applying the compensating actor transform.
+            if (userOp) window.move_frame(true, targetRect.x, targetRect.y);
 
             windowActor.set_translation(initialTx, initialTy, 0);
             if (!skipScale) {
@@ -470,7 +476,6 @@ export const AnimationsManager = GObject.registerClass(
                 const isFirstPlacement = WindowState.get(window, 'pendingFirstPlacement');
 
                 const currentRect = window.get_frame_rect();
-
                 const needsMove =
                     Math.abs(currentRect.x - rect.x) > constants.ANIMATION_DIFF_THRESHOLD ||
                     Math.abs(currentRect.y - rect.y) > constants.ANIMATION_DIFF_THRESHOLD ||

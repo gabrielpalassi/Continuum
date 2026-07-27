@@ -43,7 +43,12 @@ export function transformedFrame(window) {
     // Full-size windows use Meta's committed frame as their layout geometry.
     // In headless Shell the actor allocation can retain a stale map-effect position
     // after animations are disabled, even though Mutter accepted the frame move.
-    if (Math.abs(actor.scale_x - 1) < 0.01 && Math.abs(actor.scale_y - 1) < 0.01)
+    if (
+        Math.abs(actor.scale_x - 1) < 0.01 &&
+        Math.abs(actor.scale_y - 1) < 0.01 &&
+        Math.abs(actor.translation_x) < 0.01 &&
+        Math.abs(actor.translation_y) < 0.01
+    )
         return frame(window);
 
     const [actorX, actorY] = actor.get_position();
