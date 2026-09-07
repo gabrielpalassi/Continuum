@@ -9,6 +9,9 @@ export const WINDOW_SPACING = 8;
 // Cap on distinct drag candidates kept after de-duplication so the live nearest search
 // stays cheap. A safety net that keeps the current layout, so it never drops a reachable one.
 export const MAX_DRAG_LAYOUTS = 48;
+// Real layout scoring gets a deterministic, non-factorial candidate pool once exhaustive
+// permutation search becomes too expensive.
+export const MAX_LAYOUT_CANDIDATES = 24;
 // Wall-clock ceiling for composition generation at drag start; a last-resort guard
 // against pathological window counts.
 export const DRAG_LAYOUT_TIME_BUDGET_MS = 8;

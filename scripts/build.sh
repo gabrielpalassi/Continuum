@@ -23,3 +23,5 @@ for module in "${modules[@]}"; do
 done
 
 gnome-extensions pack --force "$source_dir" --out-dir "$output_dir" "${extra_sources[@]}"
+
+printf 'Extension archive built: %s\n' "$output_dir/continuum@gabrielpalassi.github.io.shell-extension.zip"

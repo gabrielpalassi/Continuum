@@ -4,13 +4,63 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
     enumerateTileSlots,
+    fitDragDescriptorToArea,
+    generateBoundedLayoutCandidates,
     generateRowCompositions,
+    monitorContainingPoint,
     orderWindowsByMru,
     planResizeFit,
+    requiresOverflowHandling,
     restoreBeforeRearrange,
+    selectDragDropMonitor,
+    shouldStopDragLayoutSearch,
 } from '../src/layoutPlanning.js';
 
 const windowWithId = id => ({get_id: () => id});
+const layoutDescriptor = (id, width = 400, height = 300) => ({id, width, height});
+
+test('an oversized solo window stays on its workspace while real crowding still overflows', () => {
+    const preferredSize = {width: 1398, height: 1059};
+    const workArea = {width: 1920, height: 1048};
+    const layoutOverflows =
+        preferredSize.width > workArea.width || preferredSize.height > workArea.height;
+
+    assert.equal(layoutOverflows, true);
+    assert.equal(requiresOverflowHandling(layoutOverflows, 1), false);
+    assert.equal(requiresOverflowHandling(layoutOverflows, 2), true);
+});
+
+test('pointer coordinates override a stale current-monitor fallback', () => {
+    const monitors = [
+        {index: 0, geometry: {x: 0, y: 0, width: 1280, height: 720}},
+        {index: 1, geometry: {x: 1280, y: 0, width: 1024, height: 768}},
+    ];
+
+    assert.equal(monitorContainingPoint(monitors, 640, 360, 1), 0);
+    assert.equal(monitorContainingPoint(monitors, 1280, 360, 0), 1);
+    assert.equal(monitorContainingPoint(monitors, 2304, 360, 7), 7);
+});
+
+test('a selected drag hint owns the drop monitor before most of the frame crosses', () => {
+    assert.equal(
+        selectDragDropMonitor({
+            windowMonitor: 0,
+            pointerMonitor: 1,
+            layoutMonitor: 1,
+            hasChosenLayout: true,
+        }),
+        1
+    );
+    assert.equal(
+        selectDragDropMonitor({
+            windowMonitor: 0,
+            pointerMonitor: 1,
+            layoutMonitor: 1,
+            hasChosenLayout: false,
+        }),
+        0
+    );
+});
 
 test('row composition generation covers each ordered shape exactly once', () => {
     assert.deepEqual([...generateRowCompositions(0)], []);
@@ -27,6 +77,95 @@ test('row composition generation covers each ordered shape exactly once', () => 
             )
         );
     }
+});
+
+test('bounded layout candidates try every stable insertion slot for a new sixth window', () => {
+    const windows = [
+        layoutDescriptor(1),
+        layoutDescriptor(2),
+        layoutDescriptor(3),
+        layoutDescriptor(4),
+        layoutDescriptor(5),
+        layoutDescriptor(6),
+    ];
+    const historyOrder = [1, 2, 3, 4, 5];
+    const candidates = generateBoundedLayoutCandidates(windows, {
+        historyOrder,
+        maxCandidates: 24,
+    });
+    const candidateOrders = new Set(
+        candidates.map(candidate => candidate.map(item => item.id).join())
+    );
+
+    for (let slot = 0; slot <= historyOrder.length; slot++) {
+        const expected = [...historyOrder];
+        expected.splice(slot, 0, 6);
+        assert.ok(
+            candidateOrders.has(expected.join()),
+            `Expected the entrant to be considered at slot ${slot}`
+        );
+    }
+});
+
+test('bounded layout candidates can relocate the largest changed window without factorial search', () => {
+    const windows = [
+        layoutDescriptor(1),
+        layoutDescriptor(2),
+        layoutDescriptor(3),
+        layoutDescriptor(4),
+        layoutDescriptor(5),
+        layoutDescriptor(6, 1200, 800),
+    ];
+    const stableWithoutLargest = [1, 2, 3, 4, 5];
+    const candidates = generateBoundedLayoutCandidates(windows, {
+        historyOrder: [1, 2, 3, 4, 5, 6],
+        maxCandidates: 24,
+    });
+    const candidateOrders = new Set(
+        candidates.map(candidate => candidate.map(item => item.id).join())
+    );
+
+    for (let slot = 0; slot <= stableWithoutLargest.length; slot++) {
+        const expected = [...stableWithoutLargest];
+        expected.splice(slot, 0, 6);
+        assert.ok(
+            candidateOrders.has(expected.join()),
+            `Expected the largest window to be considered at slot ${slot}`
+        );
+    }
+});
+
+test('bounded layout candidates are unique and respect their hard cap', () => {
+    const windows = Array.from({length: 40}, (_, index) =>
+        layoutDescriptor(index + 1, 400 + index * 7, 300 + index * 3)
+    );
+    const candidates = generateBoundedLayoutCandidates(windows, {
+        historyOrder: windows.slice(0, -1).map(item => item.id),
+        maxCandidates: 24,
+    });
+    const orders = candidates.map(candidate => candidate.map(item => item.id).join());
+
+    assert.equal(candidates.length, 24);
+    assert.equal(new Set(orders).size, candidates.length);
+});
+
+test('drag layout search always evaluates its first shape even after a timing stall', () => {
+    assert.equal(
+        shouldStopDragLayoutSearch({
+            shapeCount: 0,
+            elapsedMs: 20,
+            budgetMs: 8,
+        }),
+        false
+    );
+    assert.equal(
+        shouldStopDragLayoutSearch({
+            shapeCount: 1,
+            elapsedMs: 20,
+            budgetMs: 8,
+        }),
+        true
+    );
 });
 
 test('restore-first orchestration skips the ordinary rearrangement after a restore', () => {
@@ -312,6 +451,36 @@ test('fit planning distinguishes impossible layouts from layouts that fit after 
     assert.equal(scaled.kind, 'scaled');
     assert.ok(Math.abs(scaled.scale - 0.5) < 0.001);
     assert.ok(scaled.sizes[0].width <= 100);
+});
+
+test('drag preview fits a restored maximized frame into the destination work area', () => {
+    const descriptor = {id: 42, x: 343, y: 1015, width: 1877, height: 1128};
+    const fitted = fitDragDescriptorToArea(
+        descriptor,
+        {width: 100, height: 100},
+        {x: 0, y: 0, width: 1920, height: 1040},
+        true
+    );
+
+    assert.equal(fitted.id, descriptor.id);
+    assert.ok(fitted.width < descriptor.width);
+    assert.ok(fitted.height <= 1040);
+    assert.ok(fitted.width <= 1920);
+    assert.deepEqual(descriptor, {id: 42, x: 343, y: 1015, width: 1877, height: 1128});
+});
+
+test('drag preview does not invent a resize for an unresizable oversized window', () => {
+    const descriptor = {id: 42, width: 1877, height: 1128};
+
+    assert.equal(
+        fitDragDescriptorToArea(
+            descriptor,
+            {width: 100, height: 100},
+            {x: 0, y: 0, width: 1920, height: 1040},
+            false
+        ),
+        descriptor
+    );
 });
 
 test('fit planning treats an exact work-area boundary as a natural fit', () => {

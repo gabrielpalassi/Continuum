@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "all": "npm run remove && npm run build && npm run setup",
-    "build": "bash scripts/build.sh",
+    "build": "npm run fmt-lint && bash scripts/build.sh",
     "setup": "bash scripts/install.sh",
     "remove": "gnome-extensions uninstall continuum@gabrielpalassi.github.io 2>/dev/null || true",
     "start": "env MUTTER_DEBUG_DUMMY_MODE_SPECS=1256x768 dbus-run-session -- gnome-shell --nested",

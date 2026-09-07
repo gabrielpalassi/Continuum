@@ -3,7 +3,7 @@
 // by Cléo Menezes Jr. and contributors:
 // https://github.com/CleoMenezesJr/MosaicWM
 
-const DEBUG = false;
+const DEBUG = true;
 
 export function log(...args) {
     if (DEBUG) {

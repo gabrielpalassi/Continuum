@@ -508,7 +508,13 @@ export class WindowingManager {
     // a normal arrival floating over the maximized window or sends a maximized
     // arrival straight back where it came from. Move the incumbent instead, keeping
     // both windows' maximized state intact.
-    async makeRoomForUserPlacement(window, workspace, monitor, origin = null) {
+    async makeRoomForUserPlacement(
+        window,
+        workspace,
+        monitor,
+        origin = null,
+        placementRect = null
+    ) {
         const incumbent = this.getSacredOccupant(window, workspace, monitor);
         if (!incumbent) return false;
 
@@ -564,8 +570,21 @@ export class WindowingManager {
                 }
 
                 this.invalidateWindowsCache();
-                if (!this.isMaximizedOrFullscreen(window))
-                    this._tilingManager?.tileWorkspaceWindows(workspace, window, monitor, false);
+                if (!this.isMaximizedOrFullscreen(window)) {
+                    const committed = this._tilingManager?.commitDragPlacement(
+                        window,
+                        placementRect,
+                        workspace,
+                        monitor
+                    );
+                    if (!committed)
+                        this._tilingManager?.tileWorkspaceWindows(
+                            workspace,
+                            window,
+                            monitor,
+                            false
+                        );
+                }
                 Logger.log(
                     `[USER-PLACEMENT] Sacred incumbent ${incumbent.get_id()} moved into the vacated origin`
                 );
@@ -583,8 +602,16 @@ export class WindowingManager {
         // user's requested destination untouched.
         await this.moveOversizedWindow(incumbent, {switchFocus: false});
         this.invalidateWindowsCache();
-        if (!this.isMaximizedOrFullscreen(window))
-            this._tilingManager?.tileWorkspaceWindows(workspace, window, monitor, false);
+        if (!this.isMaximizedOrFullscreen(window)) {
+            const committed = this._tilingManager?.commitDragPlacement(
+                window,
+                placementRect,
+                workspace,
+                monitor
+            );
+            if (!committed)
+                this._tilingManager?.tileWorkspaceWindows(workspace, window, monitor, false);
+        }
         return true;
     }
 
@@ -665,13 +692,45 @@ export class WindowingManager {
         return candidates[0]?.monitor ?? null;
     }
 
+    _prepareMonitorPlacementEntrance(window) {
+        ShellState.set(window, 'monitorPlacementEntrancePending', true);
+        ShellState.remove(window, 'pendingFirstPlacement');
+        this._animationsManager?.cancelPendingEntrance(window);
+
+        const actor = window.get_compositor_private();
+        if (!actor || actor.is_destroyed()) return;
+
+        // The native map effect and Mosaic first-placement ease both target this
+        // actor before the monitor transaction knows its final frame. Hold it
+        // invisible in a neutral state; finishMonitorPlacement replays Shell's map
+        // effect once the destination layout is authoritative.
+        Main.wm.skipNextEffect(actor);
+        actor.remove_all_transitions();
+        actor.set_pivot_point(0, 0);
+        actor.set_translation(0, 0, 0);
+        actor.set_scale(1, 1);
+        actor.opacity = 0;
+        this._timeoutRegistry?.addIdle(() => {
+            if (
+                ShellState.get(window, 'monitorPlacementEntrancePending') &&
+                !actor.is_destroyed()
+            ) {
+                actor.remove_all_transitions();
+                actor.set_translation(0, 0, 0);
+                actor.set_scale(1, 1);
+                actor.opacity = 0;
+            }
+            return GLib.SOURCE_REMOVE;
+        }, 'windowing_holdMonitorPlacementEntrance');
+    }
+
     moveWindowToMonitor(
         window,
         workspace,
         sourceMonitor,
         targetMonitor,
         onSettled = null,
-        {deferDestinationTiling = false} = {}
+        {deferDestinationTiling = false, holdEntrance = false} = {}
     ) {
         if (
             targetMonitor === null ||
@@ -705,32 +764,18 @@ export class WindowingManager {
         Logger.log(
             `[PLACEMENT] Moving window ${window.get_id()} from monitor ${sourceMonitor} to available monitor ${targetMonitor} on WS-${workspace.index()}`
         );
-        // Usually window-created prepared this before Mutter's map effect began.
-        // Keep this fallback for the opposite signal ordering, where window-added
-        // resolves placement first.
-        if (ShellState.get(window, 'openedMaximized')) {
-            ShellState.set(window, 'monitorPlacementEntrancePending', true);
-            ShellState.remove(window, 'pendingFirstPlacement');
-            this._animationsManager?.cancelPendingEntrance(window);
-            const actor = window.get_compositor_private();
-            if (actor && !actor.is_destroyed()) {
-                Main.wm.skipNextEffect(actor);
-                actor.remove_all_transitions();
-                actor.set_translation(0, 0, 0);
-                actor.set_scale(1, 1);
-                actor.opacity = 0;
-                this._timeoutRegistry?.addIdle(() => {
-                    if (
-                        ShellState.get(window, 'monitorPlacementTarget') !== undefined &&
-                        !actor.is_destroyed()
-                    ) {
-                        actor.remove_transition('opacity');
-                        actor.opacity = 0;
-                    }
-                    return GLib.SOURCE_REMOVE;
-                }, 'windowing_holdMonitorPlacementEntrance');
-            }
-        }
+        // A newly mapped window that must change monitors cannot keep either
+        // Shell's original map effect or Mosaic's first-placement effect: both
+        // begin against the source-monitor frame. Replay Shell's effect after the
+        // destination settles instead. Explicit holdEntrance covers the rare
+        // signal order where first-placement state has not been attached yet.
+        if (
+            holdEntrance ||
+            ShellState.get(window, 'openedMaximized') ||
+            ShellState.get(window, 'pendingFirstPlacement') ||
+            ShellState.get(window, 'monitorPlacementEntrancePending')
+        )
+            this._prepareMonitorPlacementEntrance(window);
         ShellState.set(window, 'monitorPlacementSource', sourceMonitor);
         ShellState.set(window, 'monitorPlacementTarget', targetMonitor);
         if (deferDestinationTiling)
@@ -822,7 +867,9 @@ export class WindowingManager {
             // tiling. Fullscreen entrances additionally wait until their actor maps.
             const needsStableEntrance =
                 ShellState.get(window, 'monitorPlacementEntrancePending') === true;
-            if (currentMonitor === targetMonitor && (!needsStableEntrance || actor?.mapped)) {
+            const requiresMappedEntrance =
+                needsStableEntrance && this.isMaximizedOrFullscreen(window);
+            if (currentMonitor === targetMonitor && (!requiresMappedEntrance || actor?.mapped)) {
                 const frame = window.get_frame_rect();
                 const targetArea = workspace.get_work_area_for_monitor(targetMonitor);
                 const expectedWidth = Math.min(expectedSize.width, targetArea.width);
@@ -927,7 +974,10 @@ export class WindowingManager {
                 this._tilingManager.tileWorkspaceWindows(workspace, null, targetMonitor, false);
         }
 
-        if (ShellState.get(window, 'monitorPlacementEntrancePending')) {
+        if (
+            ShellState.get(window, 'monitorPlacementEntrancePending') &&
+            (!deferDestinationTiling || this.isMaximizedOrFullscreen(window))
+        ) {
             ShellState.remove(window, 'monitorPlacementEntrancePending');
             this._animationsManager?.animateMonitorPlacementEntrance(window);
         }

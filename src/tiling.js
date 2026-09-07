@@ -23,9 +23,12 @@ import {getMiniatureSize, placeMiniatureAt} from './miniature.js';
 import {isWindowAlive} from './shellState.js';
 import {
     enumerateTileSlots,
+    generateBoundedLayoutCandidates,
     generateRowCompositions,
     orderWindowsByMru,
     planResizeFit,
+    requiresOverflowHandling,
+    shouldStopDragLayoutSearch,
 } from './layoutPlanning.js';
 import {getSlowDownFactor, monotonicNow} from './timing.js';
 
@@ -429,7 +432,12 @@ export class TilingManager {
 
         const n = windowDescriptors.length;
         const dragged = windowDescriptors.find(w => w.id === draggedId);
-        if (!dragged) return [];
+        if (!dragged) {
+            Logger.warn(
+                `[DRAG] layout-search-missing-dragged id=${draggedId} descriptors=[${windowDescriptors.map(w => w.id).join(',')}]`
+            );
+            return [];
+        }
         const others = windowDescriptors.filter(w => w.id !== draggedId);
 
         const layouts = [];
@@ -439,9 +447,13 @@ export class TilingManager {
         outer: for (const shape of generateRowCompositions(n)) {
             // Budget check per shape too, since the generator is lazy and stopping here
             // caps generation (2^(n-1)) not just the inner loop.
+            const elapsedMs = (GLib.get_monotonic_time() - startTime) / 1000;
             if (
-                (GLib.get_monotonic_time() - startTime) / 1000 >
-                constants.DRAG_LAYOUT_TIME_BUDGET_MS
+                shouldStopDragLayoutSearch({
+                    shapeCount,
+                    elapsedMs,
+                    budgetMs: constants.DRAG_LAYOUT_TIME_BUDGET_MS,
+                })
             )
                 break;
             shapeCount++;
@@ -472,9 +484,15 @@ export class TilingManager {
             }
         }
 
-        Logger.log(
-            `computeDragLayouts: ${shapeCount} shapes, ${layouts.length} unique positions for window ${draggedId} in ${((GLib.get_monotonic_time() - startTime) / 1000).toFixed(1)}ms`
-        );
+        const elapsedMs = (GLib.get_monotonic_time() - startTime) / 1000;
+        const summary = `${shapeCount} shapes, ${layouts.length} unique positions for window ${draggedId} in ${elapsedMs.toFixed(1)}ms`;
+        if (layouts.length === 0) {
+            Logger.warn(
+                `[DRAG] layout-search-empty ${summary} workArea=(${workArea.x},${workArea.y},${workArea.width}x${workArea.height}) descriptors=[${windowDescriptors.map(w => `${w.id}:${w.width}x${w.height}`).join(',')}]`
+            );
+        } else {
+            Logger.log(`computeDragLayouts: ${summary}`);
+        }
         return layouts;
     }
 
@@ -545,6 +563,48 @@ export class TilingManager {
                 }
             }
         }
+    }
+
+    commitDragPlacement(window, rect, workspace, monitor) {
+        if (
+            !window ||
+            !rect ||
+            rect.width <= 0 ||
+            rect.height <= 0 ||
+            !workspace ||
+            monitor === null ||
+            monitor === undefined
+        )
+            return false;
+
+        const frame = window.get_frame_rect();
+        if (!ShellState.has(window, 'preferredSize')) {
+            ShellState.set(window, 'preferredSize', {
+                width: frame.width,
+                height: frame.height,
+            });
+        }
+        ShellState.set(window, 'originalSize', {
+            width: frame.width,
+            height: frame.height,
+        });
+        ShellState.set(window, 'isConstrainedByMosaic', true);
+        this._setSmartResizeTarget(window, rect);
+        MosaicModel.setSlot(window, rect, workspace, monitor);
+
+        const shouldAnimate = this._animationsManager?.shouldAnimateWindow(window) ?? false;
+        if (this._animationsManager) {
+            this._animationsManager.animateWindow(window, rect, {
+                subtle: true,
+            });
+        } else {
+            window.move_frame(false, rect.x, rect.y);
+            window.move_resize_frame(false, rect.x, rect.y, rect.width, rect.height);
+        }
+        Logger.info(
+            `[DRAG] placement-committed id=${window.get_id()} frame=${frame.width}x${frame.height}->${rect.width}x${rect.height} at=(${rect.x},${rect.y}) monitor=${monitor} animated=${shouldAnimate}`
+        );
+        return true;
     }
 
     // Stage a pairwise swap to be applied on the next workspace tile.
@@ -751,7 +811,8 @@ export class TilingManager {
             return;
         }
 
-        // Use heuristic orderings for 6+ windows
+        // Fit simulations use a few heuristic orderings for 6+ windows. Real layout
+        // selection has a richer bounded candidate pool in _findOptimalOrder.
         if (arr.length >= 6) {
             const byAreaDesc = [...arr].sort((a, b) => b.width * b.height - a.width * a.height);
             const byAreaAsc = [...arr].sort((a, b) => a.width * a.height - b.width * b.height);
@@ -964,8 +1025,15 @@ export class TilingManager {
         if (windows.length <= 1) return windows;
 
         const startTime = monotonicNow();
-        const permutations = this._generatePermutations(windows);
         const history = this._getLayoutHistory(windows);
+        const permutations =
+            windows.length < 6
+                ? this._generatePermutations(windows)
+                : generateBoundedLayoutCandidates(windows, {
+                      historyOrder: history?.order,
+                      positionSnapshot: this._positionSnapshot,
+                      maxCandidates: constants.MAX_LAYOUT_CANDIDATES,
+                  });
 
         let bestOrder = windows;
         let bestRank = null;
@@ -2331,11 +2399,9 @@ export class TilingManager {
 
         let tile_info = this._tile(windows, tileArea, dryRun);
         this._activePinnedShape = null;
-        let overflow = tile_info.overflow;
+        let overflow = requiresOverflowHandling(tile_info.overflow, workspace_windows.length);
 
-        if (workspace_windows.length <= 1) {
-            overflow = false;
-        } else {
+        if (workspace_windows.length > 1) {
             for (const window of workspace_windows)
                 if (this._windowingManager.isMaximizedOrFullscreen(window)) overflow = true;
         }
@@ -2837,7 +2903,15 @@ export class TilingManager {
         }
 
         const layout = this._tile(windows, availableSpace, relaxed);
-        return !layout.overflow;
+        const layoutWindowIds = new Set(working_info.meta_windows.map(w => w.get_id()));
+        layoutWindowIds.add(newWindowId);
+        const requiresOverflow = requiresOverflowHandling(layout.overflow, layoutWindowIds.size);
+        if (layout.overflow && !requiresOverflow) {
+            Logger.log(
+                `canFitWindow: Ignoring size overflow for solo window ${newWindowId}; no sibling needs another workspace`
+            );
+        }
+        return !requiresOverflow;
     }
 
     restorePreferredSize(window) {

@@ -11,6 +11,11 @@ import * as Logger from './logger.js';
 import {TileZone} from './constants.js';
 import * as constants from './constants.js';
 import {afterAnimations} from './timing.js';
+import {
+    fitDragDescriptorToArea,
+    monitorContainingPoint,
+    selectDragDropMonitor,
+} from './layoutPlanning.js';
 import * as ShellState from './shellState.js';
 
 export const RESIZE_GRAB_OPS = [
@@ -48,7 +53,11 @@ export class GrabHandler {
         this._dragMonitorId = null;
         this._currentZone = TileZone.NONE;
         this._dragPositionChangedId = 0;
+        this._dragPositionPollId = 0;
+        this._lastPolledDragState = null;
+        this._lastObservedPointerMonitor = null;
         this._isPositionProcessing = false;
+        this._positionUpdatePending = false;
         this._currentGrabOp = null;
         this._restoringFromEdgeTile = false;
         this._suppressRestoreRetile = false;
@@ -109,12 +118,34 @@ export class GrabHandler {
         return Math.sqrt(Math.pow(x, 2) + Math.pow(y, 2));
     }
 
+    _pointerMonitor(x = null, y = null) {
+        if (x === null || y === null) [x, y] = global.get_pointer();
+
+        const monitors = Array.from({length: global.display.get_n_monitors()}, (_, index) => ({
+            index,
+            geometry: global.display.get_monitor_geometry(index),
+        }));
+        return monitorContainingPoint(monitors, x, y, global.display.get_current_monitor());
+    }
+
+    _logDragState(label, level = 'info') {
+        if (!this._draggedWindow) return;
+
+        const [x, y] = global.get_pointer();
+        const frame = this._draggedWindow.get_frame_rect();
+        const pointerMonitor = this._pointerMonitor(x, y);
+        Logger[level](
+            `[DRAG] ${label} id=${this._draggedWindow.get_id()} pointer=(${x},${y}) pointerMonitor=${pointerMonitor} reportedMonitor=${global.display.get_current_monitor()} windowMonitor=${this._draggedWindow.get_monitor()} frame=(${frame.x},${frame.y},${frame.width}x${frame.height}) sacred=${this.windowingManager.isMaximizedOrFullscreen(this._draggedWindow)} awaitingRestore=${this._awaitingUnmaximizeDrag} reordering=${this._reorderingActive} layoutMonitor=${this._dragMonitorId ?? 'none'} layouts=${this._dragLayouts?.length ?? 0} zone=${this._currentZone} boxes=${this.drawingManager._boxes.length}`
+        );
+    }
+
     _onReorderingPositionChanged() {
         if (!this._reorderingActive || !this._dragContext || this._reorderingPaused) return;
 
         const {metaWindow} = this._dragContext;
         const workspace = metaWindow.get_workspace();
-        const monitor = global.display.get_current_monitor();
+        const [x, y] = global.get_pointer();
+        const monitor = this._pointerMonitor(x, y);
         // Layout coordinates belong to the monitor where they were computed.
         // The position idle rebuilds them after a monitor crossing; applying them
         // before that would either draw the hint on the source monitor or suppress
@@ -122,7 +153,6 @@ export class GrabHandler {
         if (monitor !== this._dragMonitorId) return;
 
         const workArea = workspace.get_work_area_for_monitor(monitor);
-        const [x, y] = global.get_pointer();
         const cursor = {x, y};
 
         const zone = this.edgeTilingManager.detectZone(x, y, workArea, workspace);
@@ -182,7 +212,7 @@ export class GrabHandler {
     _startReordering(metaWindow) {
         Logger.log(`startDrag called for window ${metaWindow.get_id()}`);
         const workspace = metaWindow.get_workspace();
-        const monitor = global.display.get_current_monitor();
+        const monitor = this._pointerMonitor();
         let metaWindows = this.windowingManager.getMonitorWorkspaceWindows(workspace, monitor);
 
         if (!metaWindows.find(window => window.get_id() === metaWindow.get_id()))
@@ -192,7 +222,14 @@ export class GrabHandler {
 
         const edgeTiledWindows = this.edgeTilingManager.getEdgeTiledWindows(workspace, monitor);
         const edgeTiledIds = new Set(edgeTiledWindows.map(({window}) => window.get_id()));
-        const mosaicWindows = metaWindows.filter(window => !edgeTiledIds.has(window.get_id()));
+        // Sacred occupants will be displaced on drop and never participate in the mosaic.
+        // Including their monitor-sized descriptors would make every drag preview overflow.
+        const mosaicWindows = metaWindows.filter(
+            window =>
+                !edgeTiledIds.has(window.get_id()) &&
+                (window.get_id() === metaWindow.get_id() ||
+                    !this.windowingManager.isMaximizedOrFullscreen(window))
+        );
         Logger.log(
             `startDrag: Total: ${metaWindows.length}, Edge-tiled: ${edgeTiledWindows.length}, Mosaic: ${mosaicWindows.length}`
         );
@@ -227,10 +264,28 @@ export class GrabHandler {
             width: descriptor.width,
             height: descriptor.height,
         }));
+        const workArea = remainingSpace || workspace.get_work_area_for_monitor(monitor);
+        const draggedDescriptorIndex = descriptorsCopy.findIndex(
+            descriptor => descriptor.id === metaWindow.get_id()
+        );
+        if (draggedDescriptorIndex >= 0) {
+            const descriptor = descriptorsCopy[draggedDescriptorIndex];
+            const fitted = fitDragDescriptorToArea(
+                descriptor,
+                this.tilingManager.getWindowMinimumSize(metaWindow),
+                workArea,
+                Boolean(metaWindow.allows_resize?.())
+            );
+            if (fitted !== descriptor) {
+                descriptorsCopy[draggedDescriptorIndex] = fitted;
+                Logger.info(
+                    `[DRAG] preview-fit id=${metaWindow.get_id()} ${descriptor.width}x${descriptor.height}->${fitted.width}x${fitted.height} workArea=${workArea.width}x${workArea.height}`
+                );
+            }
+        }
+
         this._dragContext = {metaWindow, id: metaWindow.get_id(), windows: descriptorsCopy};
         this._dragMonitorId = monitor;
-
-        const workArea = remainingSpace || workspace.get_work_area_for_monitor(monitor);
         this._dragLayouts = this.tilingManager.computeDragLayouts(
             descriptorsCopy,
             workArea,
@@ -239,6 +294,10 @@ export class GrabHandler {
         this._chosenLayout = null;
         this._lastTileState = null;
         Logger.log(`Pre-computed ${this._dragLayouts.length} valid drag positions`);
+        this._logDragState(
+            this._dragLayouts.length > 0 ? 'previews-built' : 'no-preview-layouts',
+            this._dragLayouts.length > 0 ? 'info' : 'warn'
+        );
 
         this._reorderingPaused = false;
         this._onReorderingPositionChanged();
@@ -289,6 +348,56 @@ export class GrabHandler {
         this._miniatureCreatedId = 0;
     }
 
+    _startDragPositionPolling() {
+        if (this._dragPositionPollId) return;
+
+        this._lastPolledDragState = null;
+        this._lastObservedPointerMonitor = this._pointerMonitor();
+        this._dragPositionPollId = this._timeoutRegistry.add(
+            constants.POLL_INTERVAL_MS,
+            () => {
+                if (!this._draggedWindow || this._currentGrabOp === null) {
+                    this._dragPositionPollId = 0;
+                    this._lastPolledDragState = null;
+                    return GLib.SOURCE_REMOVE;
+                }
+
+                const [x, y] = global.get_pointer();
+                const frame = this._draggedWindow.get_frame_rect();
+                const pointerMonitor = this._pointerMonitor(x, y);
+                const state = [
+                    x,
+                    y,
+                    pointerMonitor,
+                    this.windowingManager.isMaximizedOrFullscreen(this._draggedWindow),
+                    frame.x,
+                    frame.y,
+                    frame.width,
+                    frame.height,
+                ].join(':');
+                if (state === this._lastPolledDragState) return GLib.SOURCE_CONTINUE;
+
+                this._lastPolledDragState = state;
+                this._onDragPositionChanged();
+                if (pointerMonitor !== this._lastObservedPointerMonitor) {
+                    this._lastObservedPointerMonitor = pointerMonitor;
+                    this._logDragState('pointer-monitor-changed');
+                }
+                return GLib.SOURCE_CONTINUE;
+            },
+            'grabHandler_dragPositionPoll'
+        );
+    }
+
+    _stopDragPositionPolling() {
+        if (this._dragPositionPollId) {
+            this._timeoutRegistry.remove(this._dragPositionPollId);
+            this._dragPositionPollId = 0;
+        }
+        this._lastPolledDragState = null;
+        this._lastObservedPointerMonitor = null;
+    }
+
     // The preview miniaturizes for real, and nothing in the mosaic un-miniaturizes on its own, so
     // leaving the zone (or dropping outside it) is the only thing that can hand these back.
     _restorePreviewMiniatures() {
@@ -326,8 +435,11 @@ export class GrabHandler {
         if (isMoveGrabOp(grabpo) && !this.windowingManager.isExcluded(window)) {
             Logger.log('Edge tiling: grab begin');
             this._draggedWindow = window;
+            this._positionUpdatePending = false;
             this.tilingManager.setGrabbedWindow(window);
             this._awaitingUnmaximizeDrag = this.windowingManager.isMaximizedOrFullscreen(window);
+            this._startDragPositionPolling();
+            this._logDragState('begin');
 
             const originWorkspace =
                 window.get_workspace() ?? global.workspace_manager.get_active_workspace();
@@ -427,7 +539,7 @@ export class GrabHandler {
                                 `_grabOpBeginHandler: calling startDrag for window ${window.get_id()}`
                             );
                             this._startReordering(window);
-                            this._lastReorderMonitor = global.display.get_current_monitor();
+                            this._lastReorderMonitor = this._pointerMonitor();
 
                             // The grab is still live, so this drag needs the position listener a normal one
                             // gets; without it there is no live mosaic and no zone to snap back into.
@@ -478,20 +590,32 @@ export class GrabHandler {
         ) {
             Logger.log(`_grabOpBeginHandler: calling startDrag for window ${window.get_id()}`);
             this._startReordering(window);
-            this._lastReorderMonitor = global.display.get_current_monitor();
+            this._lastReorderMonitor = this._pointerMonitor();
         }
     };
 
     onGrabOpEnd = (_display, window, grabpo) => {
+        this._logDragState('end');
         this._currentGrabOp = null;
+        this._positionUpdatePending = false;
         this._awaitingUnmaximizeDrag = false;
+        this._stopDragPositionPolling();
         // Unconditional: a leftover id would freeze that window out of every later layout.
         this.tilingManager.setGrabbedWindow(null);
 
         const isMove = isMoveGrabOp(grabpo) || grabpo === Meta.GrabOp.KEYBOARD_MOVING;
         const destinationWorkspace =
             window.get_workspace() ?? global.workspace_manager.get_active_workspace();
-        const destinationMonitor = window.get_monitor();
+        const windowMonitor = window.get_monitor();
+        const pointerMonitor = this._pointerMonitor();
+        const hasChosenLayout =
+            this._chosenLayout !== null && this._lastTileState?.startsWith('layout-');
+        const destinationMonitor = selectDragDropMonitor({
+            windowMonitor,
+            pointerMonitor,
+            layoutMonitor: this._dragMonitorId,
+            hasChosenLayout,
+        });
         const hasSacredDestinationConflict = Boolean(
             destinationWorkspace &&
                 this.windowingManager.getSacredOccupant(
@@ -500,6 +624,17 @@ export class GrabHandler {
                     destinationMonitor
                 )
         );
+        const placementRect =
+            this._chosenLayout && this._dragMonitorId === destinationMonitor
+                ? {...this._chosenLayout.draggedRect}
+                : null;
+        const hasCrossMonitorHintDrop =
+            isMove && placementRect !== null && destinationMonitor !== windowMonitor;
+        if (hasCrossMonitorHintDrop) {
+            Logger.info(
+                `[DRAG] drop-monitor-selected id=${window.get_id()} windowMonitor=${windowMonitor} pointerMonitor=${pointerMonitor} layoutMonitor=${this._dragMonitorId} destinationMonitor=${destinationMonitor}`
+            );
+        }
 
         if (
             (isMoveGrabOp(grabpo) || grabpo === Meta.GrabOp.KEYBOARD_MOVING) &&
@@ -516,14 +651,14 @@ export class GrabHandler {
 
             if (isMoveGrabOp(grabpo) && this._currentZone !== TileZone.NONE) {
                 const workspace = window.get_workspace();
-                const monitor = global.display.get_current_monitor();
+                const [curX, curY] = global.get_pointer();
+                const monitor = this._pointerMonitor(curX, curY);
                 const workArea = workspace.get_work_area_for_monitor(monitor);
 
                 // Re-verify the mouse is actually in the zone at release time.
                 // _currentZone is updated via an idle so it can lag behind the real pointer
                 // position: if the user exits the zone and releases before the idle fires,
                 // _currentZone is still non-NONE and applyTile would fire incorrectly.
-                const [curX, curY] = global.get_pointer();
                 const actualZone = this.edgeTilingManager.detectZone(
                     curX,
                     curY,
@@ -633,7 +768,7 @@ export class GrabHandler {
             this._stopReordering(
                 window,
                 false,
-                skipTiling || isResizeEnd || hasSacredDestinationConflict
+                skipTiling || isResizeEnd || hasSacredDestinationConflict || hasCrossMonitorHintDrop
             );
 
             if (isResizeEnd) {
@@ -653,16 +788,32 @@ export class GrabHandler {
                         const workspace =
                             window.get_workspace() ??
                             global.workspace_manager.get_active_workspace();
-                        const monitor = window.get_monitor();
+                        const monitor = destinationMonitor;
                         const origin = ShellState.get(window, 'userMoveOrigin');
 
                         this.windowingManager
-                            .makeRoomForUserPlacement(window, workspace, monitor, origin)
+                            .makeRoomForUserPlacement(
+                                window,
+                                workspace,
+                                monitor,
+                                origin,
+                                placementRect
+                            )
                             .then(handledConflict => {
                                 ShellState.remove(window, 'userMoveOrigin');
 
+                                const committedPlacement =
+                                    !handledConflict &&
+                                    placementRect &&
+                                    this.tilingManager.commitDragPlacement(
+                                        window,
+                                        placementRect,
+                                        workspace,
+                                        monitor
+                                    );
                                 if (
                                     !handledConflict &&
+                                    !committedPlacement &&
                                     !this.windowingManager.isMaximizedOrFullscreen(window) &&
                                     !skipTiling
                                 ) {
@@ -741,7 +892,7 @@ export class GrabHandler {
         );
         this._awaitingUnmaximizeDrag = false;
         this._startReordering(this._draggedWindow);
-        this._lastReorderMonitor = global.display.get_current_monitor();
+        this._lastReorderMonitor = this._pointerMonitor();
     }
 
     _restartReorderingOnMonitor(workspace, monitor) {
@@ -774,7 +925,7 @@ export class GrabHandler {
         if (this._awaitingUnmaximizeDrag) return;
 
         const [x, y] = global.get_pointer();
-        const monitor = global.display.get_current_monitor();
+        const monitor = this._pointerMonitor(x, y);
         const workspace = this._draggedWindow.get_workspace();
         const workArea = workspace.get_work_area_for_monitor(monitor);
 
@@ -786,7 +937,10 @@ export class GrabHandler {
         this._reorderingPaused = isInZone;
         if (!isInZone && this._currentZone === TileZone.NONE) this._onReorderingPositionChanged();
 
-        if (this._isPositionProcessing) return;
+        if (this._isPositionProcessing) {
+            this._positionUpdatePending = true;
+            return;
+        }
         this._isPositionProcessing = true;
 
         this._timeoutRegistry.addIdle(() => {
@@ -890,11 +1044,17 @@ export class GrabHandler {
                 return GLib.SOURCE_REMOVE;
             } finally {
                 this._isPositionProcessing = false;
+                if (this._positionUpdatePending) {
+                    this._positionUpdatePending = false;
+                    this._onDragPositionChanged();
+                }
             }
         });
     }
 
     destroy() {
+        this._stopDragPositionPolling();
+
         if (this._dragPositionChangedId && this._draggedWindow) {
             try {
                 this._draggedWindow.disconnect(this._dragPositionChangedId);
@@ -919,6 +1079,7 @@ export class GrabHandler {
         this._restoringFromEdgeTile = false;
         this._suppressRestoreRetile = false;
         this._isPositionProcessing = false;
+        this._positionUpdatePending = false;
         this._currentGrabOp = null;
         this._awaitingUnmaximizeDrag = false;
         this._reorderingActive = false;

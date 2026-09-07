@@ -407,10 +407,11 @@ export const AnimationsManager = GObject.registerClass(
             return this._pendingEntranceEases.has(id) || this._animatingWindows.has(id);
         }
 
-        // A born-maximized window that must change monitors cannot use the normal
-        // Mosaic entrance: sacred windows never enter the tile layout. Its native map
-        // effect was suppressed before mapping, so reveal it only after Mutter has
-        // committed the destination monitor and frame.
+        // A newly mapped window that must change monitors cannot use the normal
+        // Mosaic entrance: its source-monitor frame is not visually meaningful.
+        // Sacred windows also never enter the tile layout. Their native map effects
+        // are suppressed before mapping, so reveal either kind only after Mutter
+        // commits the destination monitor and frame.
         animateMonitorPlacementEntrance(window) {
             const actor = window?.get_compositor_private();
             if (!actor || actor.is_destroyed()) return;

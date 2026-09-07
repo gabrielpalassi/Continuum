@@ -1454,15 +1454,20 @@ export class WindowHandler {
                         workspace,
                         monitor,
                         resizeMonitor,
-                        {deferDestinationTiling: true}
+                        {deferDestinationTiling: true, holdEntrance: true}
                     );
-                    if (moved)
-                        return await this._ensureWindowFits(
-                            window,
-                            workspace,
-                            resizeMonitor,
-                            arrivedFromDnD
-                        );
+                    if (moved) {
+                        try {
+                            return await this._ensureWindowFits(
+                                window,
+                                workspace,
+                                resizeMonitor,
+                                arrivedFromDnD
+                            );
+                        } finally {
+                            this._revealPendingMonitorPlacementEntrance(window);
+                        }
+                    }
                 }
             }
 

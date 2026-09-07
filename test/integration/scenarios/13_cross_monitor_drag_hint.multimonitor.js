@@ -8,6 +8,7 @@ import {
     Main,
     Scripting,
     assert,
+    assertNear,
     createWindows,
     destroyWindows,
     frame,
@@ -114,6 +115,33 @@ export async function run() {
             () => visibleHintIn(state.drawingManager, primaryArea),
             'a visible mosaic hint on the primary monitor while the grab is active'
         );
+
+        const hintedRect = {...state.grabHandler._chosenLayout.draggedRect};
+        assert(
+            dragged.get_monitor() !== primaryMonitor,
+            'The frame should still belong to the source monitor before release'
+        );
+        state.grabHandler.onGrabOpEnd(global.display, dragged, Meta.GrabOp.MOVING);
+        simulatedGrab = false;
+
+        await waitUntil(
+            () => dragged.get_monitor() === primaryMonitor,
+            'the selected destination hint to own the cross-monitor drop'
+        );
+        await waitUntil(() => {
+            const placed = frame(dragged);
+            return (
+                Math.abs(placed.x - hintedRect.x) <= 3 &&
+                Math.abs(placed.y - hintedRect.y) <= 3 &&
+                Math.abs(placed.width - hintedRect.width) <= 3 &&
+                Math.abs(placed.height - hintedRect.height) <= 3
+            );
+        }, 'the released window to take the selected destination geometry');
+        const placed = frame(dragged);
+        assertNear(placed.x, hintedRect.x, 3, 'Released x should match the hint');
+        assertNear(placed.y, hintedRect.y, 3, 'Released y should match the hint');
+        assertNear(placed.width, hintedRect.width, 3, 'Released width should match the hint');
+        assertNear(placed.height, hintedRect.height, 3, 'Released height should match the hint');
     } finally {
         if (simulatedGrab)
             state.grabHandler.onGrabOpEnd(global.display, dragged, Meta.GrabOp.MOVING);
