@@ -32,7 +32,9 @@ export const AnimationsManager = GObject.registerClass(
             this._isDragging = false;
             this._animatingWindows = new Map(); // Window ID -> actor, drives animations-completed signal
             this._animatingTargets = new Map(); // Window ID -> last targetRect, to detect redundant retile calls
+            this._animatingWindowDestroySignals = new Map(); // Window ID -> {actor, signalId}
             this._pendingEntranceEases = new Map(); // Window ID -> ease params, for entrances deferred until the actor is mapped
+            this._pendingEntranceMappedActors = new Map(); // Window ID -> actor with our mapped waiter
             this._justEndedDrag = false;
             this._resizingWindowId = null;
             this._timeoutRegistry = null;
@@ -76,6 +78,7 @@ export const AnimationsManager = GObject.registerClass(
                     stale = true;
                 }
                 if (stale) {
+                    this._clearAnimatingWindowDestroyWaiter(id);
                     this._animatingWindows.delete(id);
                     this._animatingTargets.delete(id);
                 }
@@ -239,8 +242,10 @@ export const AnimationsManager = GObject.registerClass(
             // the guard at the ease callback returns early without double cleanup.
             windowActor.remove_all_transitions();
 
-            this._animatingWindows.set(window.get_id(), windowActor);
-            this._animatingTargets.set(window.get_id(), targetRect);
+            const windowId = window.get_id();
+            this._animatingWindows.set(windowId, windowActor);
+            this._animatingTargets.set(windowId, targetRect);
+            this._trackAnimatingWindowDestroy(windowId, windowActor);
 
             const effectiveDuration = Math.ceil(duration * getSlowDownFactor());
 
@@ -314,20 +319,59 @@ export const AnimationsManager = GObject.registerClass(
 
             // Clutter silently skips implicit transitions on actors that aren't mapped yet
             // (should_skip_implicit_transition in clutter-actor.c) and just snaps to the
-            // final value. A first placement can easily run this early since this pipeline
-            // outpaces the actor's own mapping, so defer until onWindowCreated (windowHandler.js)
-            // confirms it's mapped, instead of calling ease() now and having it get skipped.
+            // final value. A first placement can run before the initial map or while a
+            // workspace switch temporarily unmaps an already-seen actor. Own the mapped
+            // waiter alongside the pending ease so either ordering resumes reliably.
             if (firstPlacement && !windowActor.mapped) {
-                this._pendingEntranceEases.set(window.get_id(), {windowActor, ...easeParams});
+                this._deferEntranceUntilMapped(window, windowActor, easeParams);
                 return;
             }
 
             this._runEntranceEase(window, windowActor, easeParams);
         }
 
+        _deferEntranceUntilMapped(window, windowActor, easeParams) {
+            const id = window.get_id();
+            this._pendingEntranceEases.set(id, {windowActor, ...easeParams});
+
+            const waitingActor = this._pendingEntranceMappedActors.get(id);
+            if (waitingActor === windowActor) return;
+            if (waitingActor) this._clearPendingEntranceMappedWaiter(id);
+
+            this._pendingEntranceMappedActors.set(id, windowActor);
+            windowActor.connectObject(
+                'notify::mapped',
+                () => {
+                    if (!windowActor.mapped) return;
+                    this._clearPendingEntranceMappedWaiter(id);
+                    this.runDeferredEntrance(window);
+                },
+                'destroy',
+                () => {
+                    if (this._pendingEntranceMappedActors.get(id) !== windowActor) return;
+                    this._pendingEntranceMappedActors.delete(id);
+                    this._pendingEntranceEases.delete(id);
+                    this.removeAnimatingWindow(id);
+                },
+                this
+            );
+        }
+
+        _clearPendingEntranceMappedWaiter(windowId) {
+            const actor = this._pendingEntranceMappedActors.get(windowId);
+            if (!actor) return;
+
+            this._pendingEntranceMappedActors.delete(windowId);
+            try {
+                actor.disconnectObject(this);
+            } catch (_e) {
+                // The actor may already be disposed while its destroy callback unwinds.
+            }
+        }
+
         // Runs the actual translation/scale ease. Called either immediately from
         // animateWindow (actor already mapped) or later via runDeferredEntrance,
-        // once windowHandler.js confirms the actor is mapped.
+        // once a mapped waiter confirms the actor is ready.
         _runEntranceEase(
             window,
             windowActor,
@@ -377,21 +421,21 @@ export const AnimationsManager = GObject.registerClass(
                     if (windowActor && !windowActor.is_destroyed())
                         windowActor.set_translation(0, 0, 0);
                     if (firstPlacement) ShellState.remove(window, 'pendingFirstPlacement');
-                    this._animatingWindows.delete(window.get_id());
-                    this._animatingTargets.delete(window.get_id());
-                    this._checkAllAnimationsComplete();
+                    this.removeAnimatingWindow(window.get_id());
                     ShellState.set(window, 'isMosaicResizing', false);
                     if (onComplete) onComplete();
                 },
             });
         }
 
-        // Called from windowHandler.js's onWindowCreated once the actor is confirmed
-        // mapped, safe to ease now that Clutter will no longer skip the transition outright.
+        // Called by this manager's mapped waiter or windowHandler.js's creation-time waiter,
+        // safe to ease now that Clutter will no longer skip the transition outright.
         runDeferredEntrance(window) {
-            const pending = this._pendingEntranceEases.get(window.get_id());
+            const id = window.get_id();
+            const pending = this._pendingEntranceEases.get(id);
             if (!pending) return;
-            this._pendingEntranceEases.delete(window.get_id());
+            this._clearPendingEntranceMappedWaiter(id);
+            this._pendingEntranceEases.delete(id);
             const {windowActor, ...easeParams} = pending;
             if (!windowActor || windowActor.is_destroyed()) return;
             this._runEntranceEase(window, windowActor, easeParams);
@@ -561,7 +605,35 @@ export const AnimationsManager = GObject.registerClass(
             return this._animatingTargets.get(windowId) || null;
         }
 
+        _trackAnimatingWindowDestroy(windowId, actor) {
+            const tracked = this._animatingWindowDestroySignals.get(windowId);
+            if (tracked?.actor === actor) return;
+            if (tracked) this._clearAnimatingWindowDestroyWaiter(windowId);
+
+            const signalId = actor.connect('destroy', () => {
+                const current = this._animatingWindowDestroySignals.get(windowId);
+                if (current?.actor !== actor) return;
+                this._animatingWindowDestroySignals.delete(windowId);
+                this._animatingTargets.delete(windowId);
+                if (this._animatingWindows.delete(windowId)) this._checkAllAnimationsComplete();
+            });
+            this._animatingWindowDestroySignals.set(windowId, {actor, signalId});
+        }
+
+        _clearAnimatingWindowDestroyWaiter(windowId) {
+            const tracked = this._animatingWindowDestroySignals.get(windowId);
+            if (!tracked) return;
+
+            this._animatingWindowDestroySignals.delete(windowId);
+            try {
+                tracked.actor.disconnect(tracked.signalId);
+            } catch (_e) {
+                // A destroy callback may already be unwinding for this actor.
+            }
+        }
+
         removeAnimatingWindow(windowId) {
+            this._clearAnimatingWindowDestroyWaiter(windowId);
             this._animatingTargets.delete(windowId);
             if (this._animatingWindows.delete(windowId)) {
                 this._checkAllAnimationsComplete();
@@ -572,6 +644,7 @@ export const AnimationsManager = GObject.registerClass(
         // from tiling, so it can't fire later and clobber the snap-to-visible reset.
         cancelPendingEntrance(window) {
             const id = window.get_id();
+            this._clearPendingEntranceMappedWaiter(id);
             this._pendingEntranceEases.delete(id);
             this.removeAnimatingWindow(id);
         }
@@ -590,6 +663,11 @@ export const AnimationsManager = GObject.registerClass(
         }
 
         cleanup() {
+            for (const id of this._pendingEntranceMappedActors.keys())
+                this._clearPendingEntranceMappedWaiter(id);
+            this._pendingEntranceEases.clear();
+            for (const id of this._animatingWindowDestroySignals.keys())
+                this._clearAnimatingWindowDestroyWaiter(id);
             this._animatingWindows.clear();
             this._animatingTargets.clear();
             this._checkAllAnimationsComplete();

@@ -41,6 +41,7 @@ The scenarios cover:
 - direct focus for attention-seeking windows;
 - changes while the Overview is open;
 - existing and born-maximized isolation;
+- media-key-style app activation beside a maximized window, including entrance visibility;
 - fullscreen isolation and restoration;
 - overflow miniatures, automatic restoration, anti-flapping, and restore anchors;
 - configured edge-tiling and swapping keybindings, including one-action cross-edge transitions;
