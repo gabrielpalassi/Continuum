@@ -7,5 +7,5 @@
 - Add concise logging at meaningful state transitions and failure boundaries when it aids diagnosis; avoid noisy routine logs.
 - Prefer fast policy tests when they can cover the observable behavior. Integration tests remain important for behavior that requires a real GNOME Shell environment, but use them selectively because they are slow.
 - For a bug fix, first add tests that reproduce the failure. Test observable behavior rather than implementation details.
-- Before finishing, run `npm test` and `npm run fmt-lint`. Also run `npm run test:integration` when a Shell behavior change cannot be adequately covered by policy tests and a supported GNOME Shell test environment is available.
-- Do not run `npm run all` unless explicitly asked; it uninstalls and reinstalls the user's local extension.
+- Before finishing, run `bun run test` and `bun run fmt-lint`. Also run `bun run test:integration` when a Shell behavior change cannot be adequately covered by policy tests and a supported GNOME Shell test environment is available.
+- Do not run `bun run all` unless explicitly asked; it uninstalls and reinstalls the user's local extension.

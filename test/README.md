@@ -4,11 +4,11 @@ The integration scenarios treat Continuum as a black box. Their expectations
 come from the user-facing behavior documented in the project README and schema,
 not from internal implementation details.
 
-Run fast policy tests (layout decisions, mosaic state, Shell-object liveness and state,
+Run fast policy tests with Bun (layout decisions, mosaic state, Shell-object liveness and state,
 and shortcut/schema contracts):
 
 ```bash
-npm test
+bun run test
 ```
 
 These tests are specification-first. A red test is retained when it exposes a
@@ -18,13 +18,13 @@ bug-discovery work.
 Run the real GNOME Shell scenarios:
 
 ```bash
-npm run test:integration
+bun run test:integration
 ```
 
 Run everything:
 
 ```bash
-npm run test:all
+bun run test:all
 ```
 
 Each integration scenario starts GNOME Shell 50 as an isolated headless Wayland

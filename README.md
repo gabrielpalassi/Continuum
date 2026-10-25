@@ -15,14 +15,15 @@ Requirements:
 
 - GNOME Shell 50
 - `gnome-extensions` for packaging and installation
-- Node.js and npm for development
+- Bun 1.4.4 or newer for development
 
 Continuum is not published to the GNOME Extensions website. Clone the repository, then build and install it:
 
 ```bash
 git clone https://github.com/gabrielpalassi/Continuum.git
 cd Continuum
-npm run all
+bun install --frozen-lockfile
+bun run all
 ```
 
 Reload GNOME Shell after installation. On Wayland, log out and back in, then enable the extension:
@@ -67,10 +68,10 @@ Compared with [NoAnnoyance v2](https://github.com/bdaase/noannoyance), Continuum
 
 ## Development
 
-Install the formatting and linting tools from the lockfile:
+Install the development dependencies from `bun.lock`:
 
 ```bash
-npm ci
+bun install --frozen-lockfile
 ```
 
 ### Checks
@@ -78,10 +79,12 @@ npm ci
 Run the same formatting and linting checks expected before committing:
 
 ```bash
-npm run fmt-lint
+bun run fmt-lint
 ```
 
-Use `npm run fmt-lint:fix` to apply automatic fixes. The individual commands `npm run fmt`, `npm run fmt:fix`, `npm run lint`, and `npm run lint:fix` are also available.
+Formatting uses Bun’s built-in `bun fmt` with settings in `bunfig.toml`; linting uses ESLint.
+
+Use `bun run fmt-lint:fix` to apply automatic fixes. The individual commands `bun run fmt`, `bun run fmt:fix`, `bun run lint`, and `bun run lint:fix` are also available.
 
 ### Build workflow
 
@@ -89,13 +92,13 @@ Package `src/` into
 `dist/continuum@gabrielpalassi.github.io.shell-extension.zip`:
 
 ```bash
-npm run build
+bun run build
 ```
 
 For the usual edit-build-install cycle, run:
 
 ```bash
-npm run all
+bun run all
 ```
 
 This uninstalls any currently installed copy of Continuum, rebuilds it, and installs the new archive. GNOME Shell must then reload the extension code as described in [Installing](#installing).
@@ -104,9 +107,9 @@ Useful commands while testing:
 
 | Command                      | Purpose                                        |
 | ---------------------------- | ---------------------------------------------- |
-| `npm start`                  | Start a nested Shell with one virtual monitor  |
-| `npm run start:multimonitor` | Start a nested Shell with two virtual monitors |
-| `npm run remove`             | Uninstall the Continuum extension              |
+| `bun run start`              | Start a nested Shell with one virtual monitor  |
+| `bun run start:multimonitor` | Start a nested Shell with two virtual monitors |
+| `bun run remove`             | Uninstall the Continuum extension              |
 
 Nested sessions are useful for quick interaction checks, but final testing should also be done in a real Wayland session because Continuum integrates with window placement, workspace switching, drag operations, and Shell animations.
 

@@ -6,7 +6,7 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 archive="$repo_root/dist/continuum@gabrielpalassi.github.io.shell-extension.zip"
 
 if [[ ! -f "$archive" ]]; then
-    printf 'Missing extension archive: %s\nRun npm run build first.\n' "$archive" >&2
+    printf 'Missing extension archive: %s\nRun bun run build first.\n' "$archive" >&2
     exit 1
 fi
 

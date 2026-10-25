@@ -618,11 +618,11 @@ export class GrabHandler {
         });
         const hasSacredDestinationConflict = Boolean(
             destinationWorkspace &&
-                this.windowingManager.getSacredOccupant(
-                    window,
-                    destinationWorkspace,
-                    destinationMonitor
-                )
+            this.windowingManager.getSacredOccupant(
+                window,
+                destinationWorkspace,
+                destinationMonitor
+            )
         );
         const placementRect =
             this._chosenLayout && this._dragMonitorId === destinationMonitor

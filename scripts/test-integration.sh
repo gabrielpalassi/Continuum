@@ -8,7 +8,7 @@ monitor_wrapper="$repo_dir/test/integration/add-second-monitor.sh"
 
 mkdir -p "$results_dir"
 find "$results_dir" -maxdepth 1 -type f -name '*.log' -delete
-npm run build
+bun run build
 
 restart_document_portal() {
     local command_status=$?
