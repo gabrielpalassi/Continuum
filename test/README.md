@@ -27,11 +27,15 @@ Run everything:
 bun run test:all
 ```
 
-Each integration scenario starts GNOME Shell 50 as an isolated headless Wayland
+Each integration scenario starts the installed GNOME Shell (50 or 51) as an isolated headless Wayland
 compositor, installs the freshly built extension, creates real GTK windows, and
 asserts observable `Meta.Window` geometry and state. Logs are written under
 `test-results/integration/`. A scenario also fails when GNOME Shell, Mutter,
 GJS, or Clutter emits a critical log message.
+
+The runner uses a bundled background so it does not depend on distribution wallpaper
+packages. Set `SHELL_BACKGROUND_IMAGE` to override it. Scenarios with `.animated` in
+their name keep animations enabled, including single-monitor `.animated.js` files.
 
 The scenarios cover:
 

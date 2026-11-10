@@ -3,6 +3,6 @@
   "description": "Automatic window arrangement, proactive workspaces, and immediate focus for ready windows.",
   "uuid": "continuum@gabrielpalassi.github.io",
   "url": "https://github.com/gabrielpalassi/Continuum",
-  "shell-version": ["50"],
+  "shell-version": ["50", "51"],
   "version": 1
 }

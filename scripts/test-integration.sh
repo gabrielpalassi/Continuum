@@ -6,9 +6,12 @@ extension_zip="$repo_dir/dist/continuum@gabrielpalassi.github.io.shell-extension
 results_dir="$repo_dir/test-results/integration"
 monitor_wrapper="$repo_dir/test/integration/add-second-monitor.sh"
 
+# Shell's perf background references distribution-dependent wallpaper files.
+export SHELL_BACKGROUND_IMAGE="${SHELL_BACKGROUND_IMAGE:-$repo_dir/test/integration/background.svg}"
+
 mkdir -p "$results_dir"
 find "$results_dir" -maxdepth 1 -type f -name '*.log' -delete
-bun run build
+bun run build || exit 1
 
 restart_document_portal() {
     local command_status=$?
@@ -31,7 +34,7 @@ for scenario in "$repo_dir"/test/integration/scenarios/*.js; do
         gnome-shell-test-tool
         --headless
     )
-    if [[ "$name" != *.animated.* ]]; then
+    if [[ "$name" != *.animated && "$name" != *.animated.* ]]; then
         command+=(--disable-animations)
     fi
     command+=(--extension "$extension_zip")

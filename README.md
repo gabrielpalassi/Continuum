@@ -13,7 +13,7 @@ It combines window-management behavior adapted from [Mosaic WM](https://github.c
 
 Requirements:
 
-- GNOME Shell 50
+- GNOME Shell 50 or 51
 - `gnome-extensions` for packaging and installation
 - Bun 1.4.4 or newer for development
 
@@ -115,7 +115,7 @@ Nested sessions are useful for quick interaction checks, but final testing shoul
 
 ## Architecture
 
-Continuum is a GNOME Shell 50 extension written as GJS ES modules. Its runtime entry point and composition root is `src/extension.js`.
+Continuum is a GNOME Shell 50–51 extension written as GJS ES modules. Its runtime entry point and composition root is `src/extension.js`.
 
 ### Runtime structure
 
@@ -155,6 +155,9 @@ flowchart TB
 | Window attention        | Shell's native "Window is ready" handler                                                            | Reconnect through `WindowAttentionManager` |
 
 `enable()` constructs and connects these resources; `disable()` releases them in reverse. Shell method overrides are the main compatibility hotspots when updating the supported GNOME Shell version.
+
+See the [GNOME Shell 51 compatibility review](docs/gnome-51.md) for upstream changes,
+validation, and follow-up work.
 
 ## Credits and licensing
 
