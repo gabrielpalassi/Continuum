@@ -44,6 +44,9 @@ test('integration runner enables animated scenarios and supplies an available ba
 name=$(basename "\${!#}" .js)
 printf '%s\\n' "$@" > "$CAPTURE_DIR/$name.args"
 printf '%s\\n' "\${SHELL_BACKGROUND_IMAGE:-}" > "$CAPTURE_DIR/background"
+if [[ -n "$CRITICAL_DOMAIN" ]]; then
+    printf '%s-CRITICAL: test diagnostic\\n' "$CRITICAL_DOMAIN"
+fi
 `,
         };
         for (const [name, body] of Object.entries(commands))
@@ -72,6 +75,14 @@ printf '%s\\n' "\${SHELL_BACKGROUND_IMAGE:-}" > "$CAPTURE_DIR/background"
         const background = (await readFile(join(directory, 'background'), 'utf8')).trim();
         assert.ok(background, 'the runner must supply its own background');
         assert.match(await readFile(background, 'utf8'), /<svg/);
+        for (const domain of ['St', 'GNOME Shell', 'libmutter', 'Gjs', 'Clutter']) {
+            await assert.rejects(
+                execFileAsync('bash', [join(scripts, 'test-integration.sh')], {
+                    env: {...env, CRITICAL_DOMAIN: domain},
+                }),
+                `${domain} criticals must fail the integration run`
+            );
+        }
     } finally {
         await rm(directory, {recursive: true, force: true});
     }

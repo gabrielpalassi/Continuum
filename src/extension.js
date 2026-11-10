@@ -486,6 +486,29 @@ export default class ContinuumExtension extends Extension {
         });
 
         const layoutProto = Workspace.WorkspaceLayout.prototype;
+        this._injectionManager.overrideMethod(
+            Workspace.Workspace.prototype,
+            '_doRemoveWindow',
+            originalMethod => {
+                return function (...args) {
+                    const result = originalMethod.apply(this, args);
+                    const layout = this._container.layout_manager;
+                    // A close can rebalance another window onto this monitor before
+                    // the next frame. Freezing then reuses old slots, leaving the new
+                    // preview unallocated but paintable (including its icon shadow).
+                    if (
+                        layout.layout_frozen &&
+                        layout._sortedWindows.some(
+                            window => window.visible && !window.has_allocation()
+                        )
+                    ) {
+                        Logger.log('Overview: allocating new previews before freezing layout');
+                        layout.layout_frozen = false;
+                    }
+                    return result;
+                };
+            }
+        );
         this._injectionManager.overrideMethod(layoutProto, '_createBestLayout', originalMethod => {
             const extension = this;
             return function (...args) {

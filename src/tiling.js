@@ -30,7 +30,7 @@ import {
     requiresOverflowHandling,
     shouldStopDragLayoutSearch,
 } from './layoutPlanning.js';
-import {getSlowDownFactor, monotonicNow} from './timing.js';
+import {getAnimationDuration, monotonicNow} from './timing.js';
 
 export class TilingManager {
     constructor() {
@@ -554,9 +554,7 @@ export class TilingManager {
                             translation_x: 0,
                             translation_y: 0,
                             opacity: 255,
-                            duration: Math.ceil(
-                                constants.ANIMATION_DURATION_MS * getSlowDownFactor()
-                            ),
+                            duration: getAnimationDuration(constants.ANIMATION_DURATION_MS),
                             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                         });
                     }
@@ -4009,9 +4007,7 @@ class WindowDescriptor {
                                 translation_x: 0,
                                 translation_y: 0,
                                 opacity: 255,
-                                duration: Math.ceil(
-                                    constants.ANIMATION_DURATION_MS * getSlowDownFactor()
-                                ),
+                                duration: getAnimationDuration(constants.ANIMATION_DURATION_MS),
                                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                             });
                         } else {
@@ -4045,8 +4041,8 @@ class WindowDescriptor {
                                         translation_x: 0,
                                         translation_y: 0,
                                         opacity: 255,
-                                        duration: Math.ceil(
-                                            constants.ANIMATION_DURATION_MS * getSlowDownFactor()
+                                        duration: getAnimationDuration(
+                                            constants.ANIMATION_DURATION_MS
                                         ),
                                         mode: Clutter.AnimationMode.EASE_OUT_QUAD,
                                     });

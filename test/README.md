@@ -31,7 +31,7 @@ Each integration scenario starts the installed GNOME Shell (50 or 51) as an isol
 compositor, installs the freshly built extension, creates real GTK windows, and
 asserts observable `Meta.Window` geometry and state. Logs are written under
 `test-results/integration/`. A scenario also fails when GNOME Shell, Mutter,
-GJS, or Clutter emits a critical log message.
+GJS, Clutter, or St emits a critical log message.
 
 The runner uses a bundled background so it does not depend on distribution wallpaper
 packages. Set `SHELL_BACKGROUND_IMAGE` to override it. Scenarios with `.animated` in
@@ -56,7 +56,9 @@ The scenarios cover:
 - real GTK client minimum-size constraints under overflow pressure;
 - pointer-driven move, cross-monitor drag hints, left/right edge-drop anchoring, multi-window reordering, and resize grab lifecycles;
 - complementary half/quarter edge-pair resizing and animation guard behavior;
-- interrupted miniature create/restore animation cleanup.
+- interrupted miniature create/restore animation cleanup;
+- reduced-motion placement, miniature creation, and restoration;
+- miniature pointer/touch input, hover restoration, and cancellation on leave.
 
 Headless tests exercise real Mutter and Shell state transitions, but they do not
 replace final checks in a logged-in Wayland session for global shortcut dispatch,

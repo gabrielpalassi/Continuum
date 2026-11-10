@@ -56,7 +56,7 @@ for scenario in "$repo_dir"/test/integration/scenarios/*.js; do
         fi
     fi
 
-    critical_count=$(grep -Ec '(GNOME Shell|libmutter|Gjs|Clutter)-CRITICAL' "$log_file" || true)
+    critical_count=$(grep -Ec '(GNOME Shell|libmutter|Gjs|Clutter|St)-CRITICAL' "$log_file" || true)
     critical_count=${critical_count:-0}
     if [[ "$critical_count" != "0" ]]; then
         scenario_failed=1

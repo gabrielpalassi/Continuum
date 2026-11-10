@@ -12,7 +12,7 @@ import Shell from 'gi://Shell';
 import * as Logger from './logger.js';
 import * as constants from './constants.js';
 import * as ShellState from './shellState.js';
-import {getSlowDownFactor} from './timing.js';
+import {getMotionEnabled, getAnimationDuration} from './timing.js';
 import {
     IS_MINIATURE,
     MINIATURE_SCALE,
@@ -110,11 +110,17 @@ export function placeMiniatureAt(window, targetX, targetY, {animate = false, dur
     const extLeft = ShellState.get(window, MINIATURE_EXT_LEFT) ?? 0;
     const extTop = ShellState.get(window, MINIATURE_EXT_TOP) ?? 0;
 
-    if (animate) {
+    if (animate && getMotionEnabled()) {
+        duration = getAnimationDuration(duration);
         animateMiniatureToTarget(actor, window, scale, extLeft, extTop, targetX, targetY, duration);
         ShellState.get(window, MINIATURE_OVERLAY)?.animateToPosition(duration);
     } else {
-        if (ShellState.get(window, ANIMATING_MINIATURE))
+        if (!getMotionEnabled()) {
+            ShellState.set(window, MINIATURE_TARGET_POS, {x: targetX, y: targetY});
+            applyMiniatureActorState(actor, scale, extLeft, extTop, targetX, targetY);
+            ShellState.remove(window, ANIMATING_MINIATURE);
+            ShellState.remove(window, MINIATURE_ANIM_KIND);
+        } else if (ShellState.get(window, ANIMATING_MINIATURE))
             ShellState.set(window, MINIATURE_TARGET_POS, {x: targetX, y: targetY});
         else {
             applyMiniatureActorState(actor, scale, extLeft, extTop, targetX, targetY);
@@ -208,6 +214,7 @@ const MiniatureClickOverlay = GObject.registerClass(
             this._iconSuppressReasons = new Set();
             this._iconDelayId = 0;
             this._hoverRestId = 0;
+            this._restoreIdleId = 0;
 
             // Some dialogs/XWayland clients have no app; overlay still works as click target.
             const app = Shell.WindowTracker.get_default().get_window_app(window);
@@ -237,33 +244,39 @@ const MiniatureClickOverlay = GObject.registerClass(
                 );
             }
 
-            const restore = () => {
-                Logger.log(`[MINIATURE] Click overlay clicked for ${window.get_id()}`);
-                this._miniatureManager.restoreMiniature(window, null);
-            };
-            this.connect('button-press-event', () => {
-                restore();
-                return Clutter.EVENT_STOP;
+            const clickGesture = new Clutter.ClickGesture({
+                recognize_on_press: true,
+                required_button: 0,
             });
-            // A tap never reaches this window_group sibling as an emulated button press,
-            // and Clutter.ClickAction is gone in GNOME 48+, so read the touch signal raw.
-            this.connect('touch-event', (_actor, event) => {
-                if (event.type() !== Clutter.EventType.TOUCH_BEGIN) return Clutter.EVENT_PROPAGATE;
-                restore();
-                return Clutter.EVENT_STOP;
-            });
+            clickGesture.connect('recognize', () => this._queueRestore());
+            this.add_action(clickGesture);
 
             // Mutter maps the pointer to a window by walking up from the picked actor to a
             // MetaWindowActor. This overlay is a window_group sibling, so the walk dies here
             // and focus-follows-mouse never sees the miniature. Do the hover focus ourselves.
-            this.connect('motion-event', () => {
-                this._onHover();
-                return Clutter.EVENT_PROPAGATE;
+            const motionController = new Clutter.MotionController();
+            motionController.connect('motion', () => this._onHover());
+            motionController.connect('leave', () => this._cancelHoverRest());
+            this.add_action(motionController);
+        }
+
+        _queueRestore() {
+            if (this._destroyed || this._restoreIdleId) return;
+            // Restoring can destroy this actor immediately when motion is reduced.
+            // Let the controller finish dispatch before changing its actor tree.
+            this._restoreIdleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                this._restoreIdleId = 0;
+                if (!ShellState.get(this._window, IS_MINIATURE)) return GLib.SOURCE_REMOVE;
+                Logger.log(`[MINIATURE] Input restoring ${this._window.get_id()}`);
+                this._miniatureManager.restoreMiniature(this._window, null);
+                return GLib.SOURCE_REMOVE;
             });
-            this.connect('leave-event', () => {
-                this._cancelHoverRest();
-                return Clutter.EVENT_PROPAGATE;
-            });
+        }
+
+        _cancelPendingRestore() {
+            if (!this._restoreIdleId) return;
+            GLib.source_remove(this._restoreIdleId);
+            this._restoreIdleId = 0;
         }
 
         _onHover() {
@@ -295,8 +308,7 @@ const MiniatureClickOverlay = GObject.registerClass(
             // A window that just shrank under a resting cursor would bounce straight back out.
             if (ShellState.get(this._window, 'justMiniaturized')) return;
 
-            Logger.log(`[MINIATURE] Hover focus restoring ${this._window.get_id()}`);
-            this._miniatureManager.restoreMiniature(this._window, null);
+            this._queueRestore();
         }
 
         _cancelHoverRest() {
@@ -318,6 +330,7 @@ const MiniatureClickOverlay = GObject.registerClass(
         }
 
         animateToPosition(duration) {
+            if (!getMotionEnabled()) duration = 0;
             if (this._destroyed) return;
             const tgt = ShellState.get(this._window, MINIATURE_TARGET_POS);
             const scale = ShellState.get(this._window, MINIATURE_SCALE);
@@ -336,6 +349,7 @@ const MiniatureClickOverlay = GObject.registerClass(
         }
 
         showIcon(duration) {
+            if (!getMotionEnabled()) duration = 0;
             if (this._destroyed || !this._icon) return;
             if (this._iconSuppressReasons.size > 0) return;
             this._icon.remove_transition('opacity');
@@ -351,6 +365,7 @@ const MiniatureClickOverlay = GObject.registerClass(
         }
 
         flyIconIn(dx, dy, duration) {
+            if (!getMotionEnabled()) duration = 0;
             if (this._destroyed || !this._icon) return;
             this._cancelIconDelay();
             this._icon.remove_all_transitions();
@@ -402,8 +417,10 @@ const MiniatureClickOverlay = GObject.registerClass(
         }
 
         fadeOutAndDestroy(duration) {
+            if (!getMotionEnabled()) duration = 0;
             if (this._destroyed) return;
             this.reactive = false;
+            this._cancelPendingRestore();
             this._cancelHoverRest();
             this._cancelIconDelay();
             if (!this._icon || this._icon.opacity === 0 || duration <= 0) {
@@ -421,6 +438,7 @@ const MiniatureClickOverlay = GObject.registerClass(
 
         destroy() {
             this._destroyed = true;
+            this._cancelPendingRestore();
             this._cancelHoverRest();
             this._cancelIconDelay();
             super.destroy();
@@ -515,6 +533,7 @@ export const MiniatureManager = GObject.registerClass(
         }
 
         createMiniature(window, computedSlot, forcedPreSize = null, {animate = true} = {}) {
+            animate = animate && getMotionEnabled();
             const windowActor = window.get_compositor_private();
             if (!windowActor) return false;
 
@@ -592,7 +611,7 @@ export const MiniatureManager = GObject.registerClass(
                     const animDuration = Math.max(
                         1,
                         Math.round(
-                            (constants.MINIATURE_ANIM_MS * getSlowDownFactor() * (cs - scale)) /
+                            (getAnimationDuration(constants.MINIATURE_ANIM_MS) * (cs - scale)) /
                                 Math.max(0.001, 1.0 - scale)
                         )
                     );
@@ -644,7 +663,7 @@ export const MiniatureManager = GObject.registerClass(
                     const tx = targetX - actorBefore_x - px * dw - extLeft * scale;
                     const ty = targetY - actorBefore_y - py * dh - extTop * scale;
 
-                    iconFlyDuration = Math.ceil(constants.MINIATURE_ANIM_MS * getSlowDownFactor());
+                    iconFlyDuration = getAnimationDuration(constants.MINIATURE_ANIM_MS);
                     iconFlyDx = currentFrame.x + currentFrame.width / 2 - endCenterX;
                     iconFlyDy = currentFrame.y + currentFrame.height / 2 - endCenterY;
 
@@ -666,6 +685,8 @@ export const MiniatureManager = GObject.registerClass(
                 // Instant: apply transforms synchronously so the overview's frozen
                 // slot (already set to mini) matches the actor state from the first frame.
                 applyMiniatureActorState(windowActor, scale, extLeft, extTop, targetX, targetY);
+                ShellState.remove(window, ANIMATING_MINIATURE);
+                ShellState.remove(window, MINIATURE_ANIM_KIND);
             }
 
             Logger.log(
@@ -726,7 +747,7 @@ export const MiniatureManager = GObject.registerClass(
             if (overlay) {
                 ShellState.remove(window, MINIATURE_OVERLAY);
                 overlay.fadeOutAndDestroy(
-                    Math.ceil(constants.MINIATURE_ICON_FADE_OUT_MS * getSlowDownFactor())
+                    getAnimationDuration(constants.MINIATURE_ICON_FADE_OUT_MS)
                 );
             }
 
@@ -755,7 +776,7 @@ export const MiniatureManager = GObject.registerClass(
                     duration = Math.max(
                         1,
                         Math.round(
-                            (constants.MINIATURE_ANIM_MS * getSlowDownFactor() * (1.0 - cs)) /
+                            (getAnimationDuration(constants.MINIATURE_ANIM_MS) * (1.0 - cs)) /
                                 Math.max(0.001, 1.0 - sc)
                         )
                     );
@@ -770,8 +791,10 @@ export const MiniatureManager = GObject.registerClass(
                     startScale = sc;
                     startTx = dw > 0 ? miniTgt.x - ax - startPivotX * dw - extL * sc : 0;
                     startTy = dh > 0 ? miniTgt.y - ay - startPivotY * dh - extT * sc : 0;
-                    duration = Math.ceil(constants.MINIATURE_ANIM_MS * getSlowDownFactor());
+                    duration = getAnimationDuration(constants.MINIATURE_ANIM_MS);
                 }
+
+                if (!getMotionEnabled()) duration = 0;
 
                 // Set after remove_all_transitions: create's onStopped fires synchronously and removes
                 // MINIATURE_ANIM_KIND, so setting before would be overwritten.

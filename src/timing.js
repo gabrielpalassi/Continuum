@@ -7,6 +7,7 @@
 import GLib from 'gi://GLib';
 import St from 'gi://St';
 import * as Logger from './logger.js';
+import {allowsMotion, animationDuration} from './motionPolicy.js';
 
 const FALLBACK_ANIMATION_MS = 250;
 
@@ -19,6 +20,14 @@ export function monotonicNow() {
 
 export function getAnimationsEnabled() {
     return St.Settings.get().enable_animations;
+}
+
+export function getMotionEnabled() {
+    return allowsMotion(St.Settings.get(), St.ReducedMotion?.REDUCE);
+}
+
+export function getAnimationDuration(duration) {
+    return animationDuration(duration, St.Settings.get(), St.ReducedMotion?.REDUCE);
 }
 
 export function getSlowDownFactor() {

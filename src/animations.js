@@ -12,7 +12,7 @@ import {SHOW_WINDOW_ANIMATION_TIME} from 'resource:///org/gnome/shell/ui/windowM
 import * as constants from './constants.js';
 import * as ShellState from './shellState.js';
 import {MINIATURE_ANIM_KIND} from './shellState.js';
-import {getAnimationsEnabled, getSlowDownFactor} from './timing.js';
+import {getMotionEnabled, getAnimationDuration} from './timing.js';
 import GObject from 'gi://GObject';
 
 const ANIMATION_DURATION = constants.ANIMATION_DURATION_MS;
@@ -119,7 +119,7 @@ export const AnimationsManager = GObject.registerClass(
         }
 
         shouldAnimateWindow(window, draggedWindow = null) {
-            if (!getAnimationsEnabled()) return false;
+            if (!getMotionEnabled()) return false;
             if (Main.overview.visible) return false;
             // During active resize, position all sibling windows instantly (real-time retile)
             if (this._resizingWindowId !== null) {
@@ -247,7 +247,7 @@ export const AnimationsManager = GObject.registerClass(
             this._animatingTargets.set(windowId, targetRect);
             this._trackAnimatingWindowDestroy(windowId, windowActor);
 
-            const effectiveDuration = Math.ceil(duration * getSlowDownFactor());
+            const effectiveDuration = getAnimationDuration(duration);
 
             // Bounce is reserved for a window joining or leaving the workspace. Everything
             // else (miniaturize, swap, monitor change, exclusion, smart resize, edge snap)
@@ -377,6 +377,8 @@ export const AnimationsManager = GObject.registerClass(
             windowActor,
             {effectiveDuration, animationMode, skipScale, firstPlacement, onComplete}
         ) {
+            if (!getMotionEnabled()) effectiveDuration = 0;
+
             // Position keeps its own bounce; scale and opacity run as separate eases so
             // they can use a different curve. EASE_OUT_BACK overshoots past its target
             // and clamps there, so bundled into the same ease as translation it finishes
@@ -472,7 +474,7 @@ export const AnimationsManager = GObject.registerClass(
             actor.opacity = 0;
             actor.show();
 
-            if (!getAnimationsEnabled()) {
+            if (!getMotionEnabled()) {
                 actor.set_scale(1, 1);
                 actor.set_pivot_point(0, 0);
                 actor.opacity = 255;
@@ -483,7 +485,7 @@ export const AnimationsManager = GObject.registerClass(
                 opacity: 255,
                 scale_x: 1,
                 scale_y: 1,
-                duration: SHOW_WINDOW_ANIMATION_TIME,
+                duration: getAnimationDuration(SHOW_WINDOW_ANIMATION_TIME),
                 mode: Clutter.AnimationMode.EASE_OUT_EXPO,
                 onStopped: isFinished => {
                     if (isFinished && actor && !actor.is_destroyed()) {
@@ -530,7 +532,7 @@ export const AnimationsManager = GObject.registerClass(
                 // owns clearing the opacity=0 onWindowAdded left it at and the slide-in offset.
                 if (!needsMove && !isFirstPlacement) {
                     window.move_resize_frame(false, rect.x, rect.y, rect.width, rect.height);
-                    if (!getAnimationsEnabled()) {
+                    if (!getMotionEnabled()) {
                         const actor = window.get_compositor_private();
                         if (actor && !actor.is_destroyed()) {
                             actor.remove_all_transitions();

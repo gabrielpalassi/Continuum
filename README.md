@@ -156,9 +156,6 @@ flowchart TB
 
 `enable()` constructs and connects these resources; `disable()` releases them in reverse. Shell method overrides are the main compatibility hotspots when updating the supported GNOME Shell version.
 
-See the [GNOME Shell 51 compatibility review](docs/gnome-51.md) for upstream changes,
-validation, and follow-up work.
-
 ## Credits and licensing
 
 Continuum incorporates and adapts source code from:
